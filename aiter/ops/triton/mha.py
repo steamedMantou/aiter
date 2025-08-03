@@ -423,7 +423,7 @@ def _attn_fwd(
 
     elif MAPPING_MODE == 1:  # head_first case
         chunk_size = NUM_XCD * NUM_BLOCKS
-        wid_per_batch = wid // (NUM_Q_HEADS * NUM_BLOCKS)
+        wid_per_batch = wid % (NUM_Q_HEADS * NUM_BLOCKS)
 
         off_q_head = (wid_per_batch % NUM_XCD) * (NUM_Q_HEADS // NUM_XCD) + (wid_per_batch // chunk_size)
         start_m = (wid_per_batch % chunk_size) // NUM_XCD
