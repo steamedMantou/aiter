@@ -551,13 +551,13 @@ def parse_args():
         type=int,
         default=0,
         choices=[0, 1, 2],
-        help="Mapping mode: 0=aiter_fa, 1=head_first, 2=triton_fa"
+        help="Mapping mode: 0=aiter_fa, 1=head_first, 2=triton_fa",
     )
     parser.add_argument(
         "-no_remap",
         action="store_false",
         dest="use_remap",
-        help="Disable remap functionality (only applies to aiter mode)"
+        help="Disable remap functionality (only applies to aiter mode)",
     )
 
     return parser.parse_args()
