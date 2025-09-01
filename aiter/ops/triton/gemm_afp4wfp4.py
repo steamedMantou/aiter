@@ -202,8 +202,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     K,
     stride_am,
     stride_ak,
-    stride_bk,
     stride_bn,
+    stride_bk,
     stride_ck,
     stride_cm,
     stride_cn,
@@ -267,14 +267,18 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         # Create pointers for first block of A and B input matrices
         # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
         offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+        offs_k_shuffle_arr = tl.arange(0, (BLOCK_SIZE_K // 2) * 16)
         offs_k_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_k
+        offs_k_shuffle = pid_k * (SPLITK_BLOCK_SIZE // 2) * 16 + offs_k_shuffle_arr
+ 
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
         b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            # offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
         # Create pointers for the first block of A and B scales
 
@@ -347,19 +351,25 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-            else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0
-                )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
-                )
 
+            b = (b.reshape(
+                    1,
+                    BLOCK_SIZE_N // 16,
+                    BLOCK_SIZE_K // 64,
+                    2,
+                    16,
+                    16,
+                )
+                .permute(0, 1, 4, 2, 3, 5)
+                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // 2)
+                .trans(1, 0)
+            )
+ 
             accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
-            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+            b_ptrs += (BLOCK_SIZE_K // 2) * 16 * stride_bk
             if BLOCK_SIZE_M < 32:
                 a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             else:
@@ -664,9 +674,8 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     M, K = x.shape
     N, K = w.shape
-
-    # Transpose w
-    w = w.T
+    N = N * 16
+    K = K // 16
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
