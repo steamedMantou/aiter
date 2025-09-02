@@ -270,7 +270,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         offs_k_shuffle_arr = tl.arange(0, (BLOCK_SIZE_K // 2) * 16)
         offs_k_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_k
         offs_k_shuffle = pid_k * (SPLITK_BLOCK_SIZE // 2) * 16 + offs_k_shuffle_arr
- 
+
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
         a_ptrs = a_ptr + (
@@ -278,7 +278,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         )
         b_ptrs = b_ptr + (
             # offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
+            offs_bn[:, None] * stride_bn
+            + offs_k_shuffle[None, :] * stride_bk
         )
         # Create pointers for the first block of A and B scales
 
@@ -352,7 +353,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
 
-            b = (b.reshape(
+            b = (
+                b.reshape(
                     1,
                     BLOCK_SIZE_N // 16,
                     BLOCK_SIZE_K // 64,
@@ -364,7 +366,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
                 .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // 2)
                 .trans(1, 0)
             )
- 
+
             accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
@@ -477,9 +479,11 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
-):  
+):
     shuffle_filename_suffix = "" if not shuffle else "_PRESHUFFLED"
-    if not hasattr(_get_config, "_config_dict") or not hasattr(_get_config._config_dict, f"default{shuffle_filename_suffix}"):
+    if not hasattr(_get_config, "_config_dict") or not hasattr(
+        _get_config._config_dict, f"default{shuffle_filename_suffix}"
+    ):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}.json"
@@ -490,9 +494,7 @@ def _get_config(
     key = f"{N}_{K}{shuffle_filename_suffix}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
-        fpath = (
-            f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}-N={N}-K={2*K}.json"
-        )
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}-N={N}-K={2*K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)

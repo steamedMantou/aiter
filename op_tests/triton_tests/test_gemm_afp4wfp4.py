@@ -11,6 +11,7 @@ import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
 
+
 def shuffle_scales(scales: torch.Tensor):
     scales_shuffled = scales.clone()
     sm, sn = scales_shuffled.shape
@@ -24,7 +25,9 @@ def shuffle_scales(scales: torch.Tensor):
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True, shuffle=False):
+def generate_gemm_afp4wfp4_inputs(
+    M, N, K, dtype, layout="TN", output=True, shuffle=False
+):
     torch.manual_seed(5)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
@@ -68,10 +71,15 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True, shuf
             x_scales_shuffled = shuffle_scales(x_scales)
         else:
             x_scales_shuffled = x_scales
-        
-        use_int4=False
+
+        use_int4 = False
         weight_shuffle_layout = (16, 16)
-        w_shuffed = shuffle_weight(w, layout=weight_shuffle_layout, use_int4=use_int4).reshape(w.shape[0] // weight_shuffle_layout[0], w.shape[1] * weight_shuffle_layout[0])
+        w_shuffed = shuffle_weight(
+            w, layout=weight_shuffle_layout, use_int4=use_int4
+        ).reshape(
+            w.shape[0] // weight_shuffle_layout[0],
+            w.shape[1] * weight_shuffle_layout[0],
+        )
         w_scales_shuffled = shuffle_scales(w_scales)
     else:
         w_shuffed = w
@@ -207,9 +215,17 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output, shuffle):
                 f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
             )
 
-    x, w, w_triton, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output, shuffle=shuffle)
-    )
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output, shuffle=shuffle)
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
@@ -224,8 +240,12 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output, shuffle):
             )
     else:
         if output:
-            triton_out = gemm_afp4wfp4(x, w_triton, x_scales_triton, w_scales_triton, dtype, y)
+            triton_out = gemm_afp4wfp4(
+                x, w_triton, x_scales_triton, w_scales_triton, dtype, y
+            )
         else:
-            triton_out = gemm_afp4wfp4(x, w_triton, x_scales_triton, w_scales_triton, dtype)
+            triton_out = gemm_afp4wfp4(
+                x, w_triton, x_scales_triton, w_scales_triton, dtype
+            )
 
     torch.testing.assert_close(torch_out, triton_out)
