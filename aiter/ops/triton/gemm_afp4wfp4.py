@@ -140,7 +140,7 @@ def _gemm_afp4_wfp4_kernel(
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs)
+            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -330,7 +330,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
                     .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
             b_scales = (
-                tl.load(b_scale_ptrs)
+                tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
                 .reshape(
                     BLOCK_SIZE_N // 32,
                     BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
@@ -540,7 +540,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
                 )
     
             b_scales = (
-                tl.load(b_scale_ptrs)
+                tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
                 .reshape(
                     BLOCK_SIZE_N // 32,
                     BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
