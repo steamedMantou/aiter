@@ -323,21 +323,21 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    cfg = _get_config._config_dict[key]
-    # Select config based on M
-    def get_key_for_M(m):
-        if m < 2000:
-            return "small"
-        elif m < 6017:
-            return "medium_M2000"
-        else:
-            return "medium_M6017"
-    
-    key_m = get_key_for_M(M)
-    if key_m in cfg:
-        return cfg[key_m]
-    elif "any" in cfg:
-        return cfg["any"]
+    if M < 32 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32 and "medium_M32" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256 and "large" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["large"]
     else:
-        raise KeyError(f"No configuration found for M={M}, N={N}, K={K}")
-
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+        elif "xlarge" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["xlarge"]
