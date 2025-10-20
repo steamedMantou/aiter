@@ -7,11 +7,13 @@ import logging
 import numpy as np
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
+)
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     attention_ref,

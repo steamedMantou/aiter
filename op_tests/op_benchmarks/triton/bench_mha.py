@@ -6,10 +6,12 @@ import itertools
 import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     generate_random_padding_mask,
