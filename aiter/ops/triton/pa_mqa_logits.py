@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
     _deepgemm_fp8_paged_mqa_logits_stage1,
@@ -18,8 +19,7 @@ from aiter.ops.shuffle import shuffle_weight
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_scale,
+    kv_cache_fp8,  # dtype = float8
     weights: torch.Tensor,  # dtype = float32
     out_logits: torch.Tensor,  # dtype = float32
     prefix_sum_context_lens: torch.Tensor,
@@ -32,6 +32,14 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
 
     TileQCount = batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5
+
+    kv_cache_fp8, kv_cache_scale = (
+        kv_cache_fp8[..., :hidden_dim],
+        kv_cache_fp8[..., hidden_dim:],
+    )
+
+    kv_cache_scale = kv_cache_scale.view(torch.float32)
+    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
         "ChunkQ": heads,
@@ -174,14 +182,12 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
 
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_scale,
+    kv_cache,
     weights: torch.Tensor,  # dtype = float32
     out_logits: torch.Tensor,  # dtype = float32
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
-    max_block_len: int,
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
@@ -189,7 +195,7 @@ def deepgemm_fp8_paged_mqa_logits(
     WavePerEU: int = 2,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    _, max_blk_len = kv_indices.size()
+    _, max_block_len = kv_indices.size()
 
     TileQCount = batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
@@ -207,6 +213,7 @@ def deepgemm_fp8_paged_mqa_logits(
     grid = (batch_size * next_n * config["SplitKV"],)
     if Preshuffle:
         assert KVBlockSize == 16
+        kv_cache_fp8, kv_cache_scale = kv_cache
         dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle[grid](
             batch_size,
             next_n,
@@ -232,6 +239,15 @@ def deepgemm_fp8_paged_mqa_logits(
         )
     else:
         assert KVBlockSize == 1
+
+        kv_cache_fp8, kv_cache_scale = (
+            kv_cache[..., :hidden_dim],
+            kv_cache[..., hidden_dim:],
+        )
+
+        kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+        kv_cache_scale = kv_cache_scale.view(torch.float32)
+
         dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits[grid](
             batch_size,
             next_n,
@@ -255,3 +271,4 @@ def deepgemm_fp8_paged_mqa_logits(
             waves_per_eu=WavePerEU,
             **config,
         )
+        # print(">> HASH: ", triton.runtime.cache.get_cache_manager(dump_kernel.hash).key)
