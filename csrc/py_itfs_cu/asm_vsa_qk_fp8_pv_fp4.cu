@@ -27,6 +27,13 @@ constexpr int kNumCus  = 256;       // MI355X CU count
 constexpr int kOcc     = 2;         // waves/EU target -> 2 workgroups/CU
 constexpr int kGridCap = kNumCus * kOcc;   // 512 outer waves
 
+// The .co is compiled with NUM_HEADS=4 baked into the inner loop bound
+//   total_tiles = B * NUM_HEADS * num_q_blks
+// Anywhere else in the kernel `B` is unused — only `total_tiles` and the
+// flat `off_bh` (= logical_idx / num_q_blks) matter.  So the launcher
+// passes a *synthetic* B such that B * NUM_HEADS_KERNEL == BH.
+constexpr int kNumHeadsKernel = 4;
+
 // ---------------------------------------------------------------------------
 // 400-byte kernarg layout — must match the kernel signature
 //   __global__ void vsa_qk_fp8_pv_fp4_kernel(
@@ -154,6 +161,15 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,
     TORCH_CHECK(BH % B == 0,
                 "vsa_qk_fp8_pv_fp4: q.size(0)=", BH,
                 " must be divisible by B=", B);
+    // The .co hard-codes NUM_HEADS=4 in `total_tiles = B * NUM_HEADS * nqb`.
+    // We forward a synthetic B_eff = BH / 4 so the kernel walks exactly
+    // BH * num_q_blks tiles regardless of the user's real (B, H) split.
+    TORCH_CHECK(BH % kNumHeadsKernel == 0,
+                "vsa_qk_fp8_pv_fp4: q.size(0)=", BH,
+                " must be divisible by ", kNumHeadsKernel,
+                " (the kernel was compiled with NUM_HEADS=", kNumHeadsKernel,
+                "; pad heads or request a re-built .co with NUM_HEADS=1)");
+    const int32_t B_eff = static_cast<int32_t>(BH / kNumHeadsKernel);
     const int64_t total_tiles = BH * num_q_blks;
     TORCH_CHECK(total_tiles > 0,
                 "vsa_qk_fp8_pv_fp4: empty workload (BH*num_q_blks == 0)");
@@ -167,7 +183,7 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,
                             stream));
 
     KernelArgs a{};
-    a.B                    = static_cast<int32_t>(B);
+    a.B                    = B_eff;   // see kNumHeadsKernel comment above
     a.T                    = static_cast<int32_t>(T);
     a.num_q_blks           = static_cast<int32_t>(num_q_blks);
     a.max_kv_blks          = static_cast<int32_t>(max_kv);
