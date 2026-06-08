@@ -114,6 +114,35 @@ namespace py = pybind11;
           py::arg("out"),                               \
           py::arg("input"));
 
+#define FP4_MQA_LOGITS_PYBIND                                          \
+    m.def("fp4_mqa_logits",                                            \
+          &aiter::fp4_mqa_logits,                                      \
+          "Dense (non-paged) MXFP4 MQA-logits (FP4 counterpart of "    \
+          "fp8_mqa_logits). Writes and returns `out`.",                \
+          py::arg("q_p"),                                              \
+          py::arg("q_s"),                                              \
+          py::arg("kv_p"),                                             \
+          py::arg("kv_s"),                                             \
+          py::arg("weights"),                                          \
+          py::arg("cu_starts"),                                        \
+          py::arg("cu_ends"),                                          \
+          py::arg("out"),                                              \
+          py::arg("split_kv"),                                         \
+          py::arg("core"));                                            \
+    m.def("fp4_paged_mqa_logits",                                      \
+          &aiter::fp4_paged_mqa_logits,                                \
+          "Paged MXFP4 MQA-logits (FP4 counterpart of "               \
+          "fp8_paged_mqa_logits). Writes and returns `out_logits`.",   \
+          py::arg("q_p"),                                              \
+          py::arg("q_s"),                                              \
+          py::arg("kv_cache"),                                         \
+          py::arg("block_tables"),                                     \
+          py::arg("weights"),                                          \
+          py::arg("context_lens"),                                     \
+          py::arg("out_logits"),                                       \
+          py::arg("max_model_len"),                                    \
+          py::arg("split_kv"));
+
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
     m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");    \

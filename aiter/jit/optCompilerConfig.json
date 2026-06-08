@@ -26,6 +26,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_fp4_mqa_logits": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fp4_mqa_logits_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fp4_mqa_logits.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fp4_mqa_logits_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DWARPS=4'",
+            "'-O3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/attention_kernels.cu'",
