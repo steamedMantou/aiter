@@ -69,11 +69,14 @@ def quantize_fp8_e8m0_vec_triton(x: torch.Tensor, group_size: int = 128):
     return out_fp8.reshape(orig_shape), out_scale.reshape(orig_shape[:-1] + (num_groups,))
 
 
-def dequant_e8m0_fp8(q: torch.Tensor, scale_byte: torch.Tensor) -> torch.Tensor:
+def dequant_e8m0_fp8(
+    q: torch.Tensor, scale_byte: torch.Tensor, group_size: int
+) -> torch.Tensor:
     scale = torch.pow(
         torch.tensor(2.0, device=q.device, dtype=torch.float32),
         scale_byte.to(torch.float32) - 127.0,
     )
+    scale = scale.repeat_interleave(group_size, dim=-1)
     return q.to(torch.float32) * scale
 
 
@@ -96,11 +99,12 @@ def error_stats(name: str, dq: torch.Tensor, ref: torch.Tensor):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare FP8 quantization performance at 128-value scale granularity."
+        description="Compare FP8 quantization performance across rowblock, vec, and block kernels."
     )
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
@@ -112,7 +116,8 @@ def main():
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required"
-    assert args.head_dim == 128, "This script compares equal 128-value scale granularity"
+    assert args.head_dim == 128, "This script uses head_dim=128 for block_quantize baseline"
+    assert args.head_dim % args.group_size == 0, "head_dim must be divisible by group_size"
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     x = make_input(args.heads, args.seq_len, args.head_dim, dtype)
@@ -121,10 +126,10 @@ def main():
     seqlens_list = [args.seq_len]
 
     def run_e8m0_rowblock_fp8():
-        return quantize_fp8_e8m0_triton(x, group_size=128)
+        return quantize_fp8_e8m0_triton(x, group_size=args.group_size)
 
     def run_e8m0_vec_fp8():
-        return quantize_fp8_e8m0_vec_triton(x, group_size=128)
+        return quantize_fp8_e8m0_vec_triton(x, group_size=args.group_size)
 
     def run_block_fp8():
         return block_quantize(
@@ -137,9 +142,9 @@ def main():
 
     print(f"Input shape: {tuple(x.shape)}, dtype={x.dtype}")
     print("Scale granularity:")
-    print("  _quantize_fp8_e8m0_rowblock_kernel: 128 values/share one E8M0 scale")
-    print("  _quantize_fp8_e8m0_vec_kernel     : 128 values/share one E8M0 scale")
-    print("  block_quantize_kernel             : 128 values/share one fp32 scale")
+    print(f"  _quantize_fp8_e8m0_rowblock_kernel: {args.group_size} values/share one E8M0 scale")
+    print(f"  _quantize_fp8_e8m0_vec_kernel     : {args.group_size} values/share one E8M0 scale")
+    print(f"  block_quantize_kernel             : {args.head_dim} values/share one fp32 scale")
 
     (row_q, row_s), row_time = bench_cuda(run_e8m0_rowblock_fp8, args.warmup, args.iters)
     row_info = (row_q.dtype, row_s.dtype, tuple(row_s.shape))
@@ -164,8 +169,8 @@ def main():
     print(f"  block fp8 dtype        : {block_info[0]}, scale dtype={block_info[1]}, scale shape={block_info[2]}")
 
     if not args.perf_only:
-        row_dq = dequant_e8m0_fp8(row_q, row_s)
-        vec_dq = dequant_e8m0_fp8(vec_q, vec_s)
+        row_dq = dequant_e8m0_fp8(row_q, row_s, args.group_size)
+        vec_dq = dequant_e8m0_fp8(vec_q, vec_s, args.group_size)
         block_dq = dequant_block_fp8(block_q, block_s)
         error_stats("Rowblock E8M0 FP8", row_dq, x)
         error_stats("Vec E8M0 FP8", vec_dq, x)

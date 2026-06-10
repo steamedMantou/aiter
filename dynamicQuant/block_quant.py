@@ -449,7 +449,7 @@ def _quantize_fp8_e8m0_vec_kernel(
         triton.Config({"BLOCK_ROWS": 8}, num_warps=4),
         triton.Config({"BLOCK_ROWS": 16}, num_warps=4),
     ],
-    key=["N"],
+    key=["N", "GROUP_SIZE"],
 )
 @triton.jit
 def _quantize_fp8_e8m0_rowblock_kernel(
@@ -459,19 +459,25 @@ def _quantize_fp8_e8m0_rowblock_kernel(
     stride_row,
     NUM_ROWS: tl.constexpr,
     N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
     """
-    Specialized path for one scale per row (GROUP_SIZE == N).
-    One program handles multiple rows to reduce scheduling overhead on long sequences.
+    Row-batched FP8 path.
+    One program handles multiple rows and all groups in each row to reduce scheduling
+    overhead on long sequences. Supports GROUP_SIZE == N and smaller groups such as 32.
     """
     pid = tl.program_id(0)
-    row_offs = (pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
-    elem_offs = tl.arange(0, N).to(tl.int64)
+    row_group_offs = tl.arange(0, BLOCK_ROWS * NUM_GROUPS).to(tl.int64)
+    row_offs = (pid * BLOCK_ROWS + row_group_offs // NUM_GROUPS).to(tl.int64)
+    group_offs = (row_group_offs % NUM_GROUPS).to(tl.int64)
+    elem_inner = tl.arange(0, GROUP_SIZE).to(tl.int64)
     row_mask = row_offs < NUM_ROWS
 
-    ptrs = X_ptr + row_offs[:, None] * stride_row + elem_offs[None, :]
+    elem_offs = group_offs[:, None] * GROUP_SIZE + elem_inner[None, :]
+    ptrs = X_ptr + row_offs[:, None] * stride_row + elem_offs
     x = tl.load(ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
 
     amax = tl.max(tl.abs(x), axis=1)
@@ -491,11 +497,11 @@ def _quantize_fp8_e8m0_rowblock_kernel(
     x_norm = tl.minimum(tl.maximum(x_norm, -FP8_MAX), FP8_MAX)
     x_fp8 = x_norm.to(tl.float8e4nv)
 
-    out_ptrs = OUT_ptr + row_offs[:, None] * stride_row + elem_offs[None, :]
+    out_ptrs = OUT_ptr + row_offs[:, None] * stride_row + elem_offs
     tl.store(out_ptrs, x_fp8, mask=row_mask[:, None])
 
     scale_byte = tl.minimum(tl.maximum(scale_byte_i32, 0), 255).to(tl.uint8)
-    tl.store(SCALE_ptr + row_offs, scale_byte, mask=row_mask)
+    tl.store(SCALE_ptr + row_offs * NUM_GROUPS + group_offs, scale_byte, mask=row_mask)
 
 @triton.jit
 def _fp4_perchannel_kblock_kernel_v2(
@@ -711,18 +717,20 @@ def quantize_fp8_e8m0_triton(
     out_fp8 = torch.empty(num_rows, N, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.empty(num_rows, num_groups, dtype=torch.uint8, device=x.device)
 
-    if num_groups == 1:
+    if num_groups == 1 or group_size == 32:
         grid = lambda META: (triton.cdiv(num_rows, META["BLOCK_ROWS"]),)
         _quantize_fp8_e8m0_rowblock_kernel[grid](
             x_flat, out_fp8, out_scale,
             N,  # stride_row (contiguous)
             NUM_ROWS=num_rows,
             N=N,
+            GROUP_SIZE=group_size,
+            NUM_GROUPS=num_groups,
             FP8_MAX=_FP8_MAX,
         )
     else:
         # Choose BLOCK_GROUPS: tile multiple groups per iteration for better utilization
-        # For D=128, group_size=32 → 4 groups per row, BLOCK_GROUPS=4 processes entire row in one tile
+        # BLOCK_GROUPS processes multiple scale groups per row in one program.
         BLOCK_GROUPS = min(num_groups, 16)  # cap at 16 to limit register pressure
 
         grid = (num_rows,)
