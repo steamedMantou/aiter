@@ -30,6 +30,9 @@ void launch_fp4_pa_mqa(const uint8_t* q_p,
                        int max_block_len,
                        int kv_stride,
                        int split_kv,
+                       int layout,
+                       int block_size,
+                       int blk_stride,
                        long stream);
 
 void launch_fp4_mqa_dense(const uint8_t* q_p,
@@ -110,6 +113,15 @@ torch::Tensor fp4_mqa_logits(torch::Tensor& q_p,
     return out;
 }
 
+// layout selects the KV-cache layout, matching the FP8 "gluon" paged op:
+//   0 = interleaved   (non-preshuffle, KVBlockSize==1): per-token fused 80B rows,
+//                      block_tables[b,j] is a per-token slot; kv is flattened to
+//                      [num_blocks, 80] and addressed with the fixed FP4_KV_STRIDE.
+//   1 = segregated    (non-preshuffle, KVBlockSize>1): paged cache, block_tables
+//                      maps logical->physical block; blk_stride is the per-block
+//                      byte stride (= kv_cache.stride(0), page padding included).
+//   2 = preshuffle    (KVBlockSize multiple of 16): FP8-gluon preshuffle layout.
+// For layout 1/2 the cache tensor is used as-is via blk_stride (do NOT flatten it).
 torch::Tensor fp4_paged_mqa_logits(torch::Tensor& q_p,
                                    torch::Tensor& q_s,
                                    torch::Tensor& kv_cache,
@@ -118,7 +130,10 @@ torch::Tensor fp4_paged_mqa_logits(torch::Tensor& q_p,
                                    torch::Tensor& context_lens,
                                    torch::Tensor& out_logits,
                                    int64_t max_model_len,
-                                   int64_t split_kv)
+                                   int64_t split_kv,
+                                   int64_t layout,
+                                   int64_t block_size,
+                                   int64_t blk_stride)
 {
     const int B             = static_cast<int>(q_p.size(0));
     const int N             = static_cast<int>(q_p.size(1));
@@ -139,6 +154,9 @@ torch::Tensor fp4_paged_mqa_logits(torch::Tensor& q_p,
                       max_block_len,
                       FP4_KV_STRIDE,
                       static_cast<int>(split_kv),
+                      static_cast<int>(layout),
+                      static_cast<int>(block_size),
+                      static_cast<int>(blk_stride),
                       current_hip_stream());
     return out_logits;
 }

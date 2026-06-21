@@ -107,17 +107,42 @@ __device__ __forceinline__ float group_sum4_valu(float part, int lane) {
 
 // HEADS is a template param so the per-lane head loop unrolls and the
 // Q/weight register arrays are sized at compile time.
-template <int HEADS>
+//
+// LAYOUT selects the KV-cache layout at compile time (zero runtime branch), to
+// match the two layouts the FP8 "gluon" deepgemm_fp8_paged_mqa_logits accepts:
+//
+//   LAYOUT_INTERLEAVED (non-preshuffle, KVBlockSize==1): the FP8-gluon
+//     non-preshuffle layout. One physical block == one token; per-token
+//     block_tables. Each row is the fused MXFP4 token [D/2 e2m1 | D/32 e8m0 | pad]
+//     (kv_stride bytes). krow = kv + block_tables[b,jj]*kv_stride.
+//
+//   LAYOUT_SEGREGATED (non-preshuffle, KVBlockSize>1): segregated paged cache,
+//     block_tables maps logical->physical block (granularity = block_size
+//     tokens). Within a block: data region [0, block_size*DP) token-major, then
+//     scale region [block_size*DP, block_size*(DP+DS)) token-major.
+//     blk_stride = bytes per physical block (= kv_cache.stride(0), padding incl).
+//
+//   LAYOUT_PRESHUFFLE (KVBlockSize multiple of 16): the FP8-gluon preshuffle
+//     layout. Same segregated data|scale regions and per-block block_tables, but
+//     the data region is swizzled by shuffle_weight(layout=(16,16)) over the
+//     [block_size, DP] byte matrix so each lane reads 16 contiguous bytes:
+//       byte(pos, lg) = (pos/16)*16*DP + lg*256 + (pos%16)*16 .
+//     The scale region stays token-major (un-shuffled), mirroring the FP8 kernel.
+enum { LAYOUT_INTERLEAVED = 0, LAYOUT_SEGREGATED = 1, LAYOUT_PRESHUFFLE = 2 };
+
+template <int HEADS, int LAYOUT = LAYOUT_INTERLEAVED>
 __global__ void fp4_pa_mqa_kernel(
     const uint8_t* __restrict__ q_p,    // [B,N,H,D/2]
     const uint8_t* __restrict__ q_s,    // [B,N,H,D/32]
-    const uint8_t* __restrict__ kv,     // [num_blocks, kv_stride] fused fp4|sf
+    const uint8_t* __restrict__ kv,     // interleaved: [num_blocks, kv_stride]
+                                        // seg/preshuffle: [num_blocks, blk_stride]
     const int*     __restrict__ block_tables,  // [B, max_block_len]
     const float*   __restrict__ weights,       // [B*N, H]
     float*         __restrict__ out,           // [B*N, max_model_len]
     const int*     __restrict__ context_lens,  // [B]
     int B, int N, int max_model_len, int max_block_len,
-    int kv_stride, int split_kv)
+    int kv_stride, int split_kv,
+    int block_size, int blk_stride)     // seg/preshuffle only (else ignored)
 {
     constexpr int DP = 64;          // D/2 packed bytes  (D = 128)
     constexpr int DS = 4;           // D/32 scale blocks
@@ -168,10 +193,26 @@ __global__ void fp4_pa_mqa_kernel(
 
     auto gather = [&](int t_idx, int4v& bK, int& sbK) {
         const int jj = t_idx * 16 + lt;
-        const int blk = (jj < ctx) ? block_tables[bt_row + jj] : 0;
-        const uint8_t* krow = kv + (size_t)blk * kv_stride;
-        bK = load16v4(krow + 16 * lg);
-        sbK = (int)krow[DP + lg];
+        if constexpr (LAYOUT == LAYOUT_INTERLEAVED) {
+            const int blk = (jj < ctx) ? block_tables[bt_row + jj] : 0;
+            const uint8_t* krow = kv + (size_t)blk * kv_stride;
+            bK = load16v4(krow + 16 * lg);
+            sbK = (int)krow[DP + lg];
+        } else {
+            // segregated / preshuffle: logical->physical block, then in-block offset.
+            const int phys = (jj < ctx) ? block_tables[bt_row + jj / block_size] : 0;
+            const uint8_t* base = kv + (size_t)phys * blk_stride;
+            const int pos = jj % block_size;
+            if constexpr (LAYOUT == LAYOUT_PRESHUFFLE) {
+                // shuffle_weight(16,16) over [block_size, DP]: the 16 bytes a lane
+                // owns (db = 16*lg + 0..15) are contiguous at this offset.
+                bK = load16v4(base + (size_t)(pos / 16) * (16 * DP)
+                                   + (size_t)lg * 256 + (size_t)(pos % 16) * 16);
+            } else {
+                bK = load16v4(base + (size_t)pos * DP + 16 * lg);  // data region
+            }
+            sbK = (int)base[(size_t)block_size * DP + pos * DS + lg];  // scale region
+        }
     };
 
     auto compute = [&](int t_idx, int4v bK, int sbK) {
@@ -220,6 +261,142 @@ __global__ void fp4_pa_mqa_kernel(
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) { Kc[u] = Kn[u]; Sc[u] = Sn[u]; }
+    }
+}
+
+// ---- dedicated preshuffle kernel -----------------------------------------
+// Specialized FP4 path for the FP8-gluon preshuffle KV layout. KVBLK (tokens
+// per physical block, a multiple of 16) is a compile-time constant, which lets
+// us drop the per-lane integer div/mod and the redundant per-lane block_tables
+// gather that the generic LAYOUT_PRESHUFFLE branch pays:
+//   * one 16-token tile lives entirely in ONE physical block, so the physical
+//     block id depends only on the tile index -> a single SCALAR load per tile
+//     (broadcast to all lanes) instead of 16 identical per-lane loads;
+//   * the in-block 16-group rank (rank16) and the swizzled data offset are pure
+//     compile-time-strided expressions (no `% block_size` / `/ block_size`);
+//   * tiles are bounded by total_tiles == ceil(ctx/16) and the per-block table
+//     has ceil(maxctx/KVBLK) entries, so the per-lane `jj < ctx` OOB guard in
+//     the gather is unnecessary (masking still happens at store time).
+// In the latency-bound decode regime these removed scalar/VALU ops are what
+// closed the gap to (and past) the FP8 gluon preshuffle kernel.
+template <int HEADS, int KVBLK, int UNR = UNROLL, int NW = WARPS>
+__global__ __launch_bounds__(NW * LANES) void fp4_pa_mqa_preshuffle_kernel(
+    const uint8_t* __restrict__ q_p,    // [B,N,H,D/2]
+    const uint8_t* __restrict__ q_s,    // [B,N,H,D/32]
+    const uint8_t* __restrict__ kv,     // [num_blocks, blk_stride] preshuffled
+    const int*     __restrict__ block_tables,  // [B, max_block_len] per-block
+    const float*   __restrict__ weights,       // [B*N, H]
+    float*         __restrict__ out,           // [B*N, max_model_len]
+    const int*     __restrict__ context_lens,  // [B]
+    int B, int N, int max_model_len, int max_block_len,
+    int kv_stride, int split_kv,
+    int block_size, int blk_stride)     // block_size == KVBLK (runtime mirror)
+{
+    constexpr int DP = 64;          // D/2 packed bytes  (D = 128)
+    constexpr int DS = 4;           // D/32 scale blocks
+    constexpr int HT = HEADS / 16;  // head tiles
+    constexpr int K16 = KVBLK / 16; // 16-token groups per physical block
+
+    const int pid = blockIdx.x;
+    const int nn  = pid % N;
+    int rem       = pid / N;
+    const int b   = rem % B;
+    const int split = rem / B;
+
+    const int ctx = context_lens[b];
+    if (ctx <= 0) return;
+
+    const int total_tiles = (ctx + 15) / 16;
+    const int tiles_per_split = (total_tiles + split_kv - 1) / split_kv;
+    const int tile_start = split * tiles_per_split;
+    const int tile_end   = min(tile_start + tiles_per_split, total_tiles);
+    if (tile_start >= tile_end) return;
+
+    const int warp = threadIdx.x / LANES;
+    const int lane = threadIdx.x % LANES;
+    const int lt   = lane & 15;     // token within tile / Q input-row
+    const int lg   = lane >> 4;     // kgroup (input) / head-group (output)
+
+    // ---- Load Q + scales + weights once (reused over all token tiles) ----
+    const int qn = (b * N + nn);
+    const uint8_t* q_p_base = q_p + (size_t)qn * HEADS * DP;
+    const uint8_t* q_s_base = q_s + (size_t)qn * HEADS * DS;
+    const float*   w_base   = weights + (size_t)qn * HEADS;
+
+    int4v qreg[HT];
+    int   qscale[HT];
+    float wreg[HT][4];
+#pragma unroll
+    for (int ht = 0; ht < HT; ++ht) {
+        const int head_in = 16 * ht + lt;
+        qreg[ht]   = load16v4(q_p_base + (size_t)head_in * DP + 16 * lg);
+        qscale[ht] = (int)q_s_base[(size_t)head_in * DS + lg];
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+            wreg[ht][r] = w_base[16 * ht + 4 * lg + r];
+    }
+
+    const int limit   = ctx - N + nn;
+    const size_t bt_row = (size_t)b * max_block_len;
+    float* out_row = out + (size_t)qn * max_model_len;
+
+    // Per-lane in-block byte offsets are fixed across the whole tile loop (they
+    // depend only on lt/lg), so hoist them out of the gather.
+    const size_t data_off  = (size_t)lg * 256 + (size_t)lt * 16;  // + rank16*16*DP
+    const int    scale_col = lt * DS + lg;                         // + rank16*16*DS
+
+    auto gather = [&](int t_idx, int4v& bK, int& sbK) {
+        const int logical_blk = t_idx / K16;              // K16 compile-time
+        const int rank16      = t_idx - logical_blk * K16;  // t_idx % K16
+        const int phys = block_tables[bt_row + logical_blk];  // scalar (uniform)
+        const uint8_t* base = kv + (size_t)phys * blk_stride;
+        bK  = load16v4(base + (size_t)rank16 * (16 * DP) + data_off);
+        sbK = (int)base[(size_t)KVBLK * DP + (size_t)rank16 * (16 * DS) + scale_col];
+    };
+
+    auto compute = [&](int t_idx, int4v bK, int sbK) {
+#if defined(FP4_MEMONLY)
+        float part = (float)(bK[0] ^ bK[1] ^ bK[2] ^ bK[3] ^ sbK);  // isolate gather BW
+#else
+        const int8v Kop = widen(bK);
+        float part = 0.0f;
+#pragma unroll
+        for (int ht = 0; ht < HT; ++ht) {
+            float4v acc = {0.f, 0.f, 0.f, 0.f};
+            acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+                widen(qreg[ht]), Kop, acc, 4, 4, 0, qscale[ht], 0, sbK);
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+                part += fmaxf(acc[r], 0.0f) * wreg[ht][r];
+        }
+#endif
+        part = group_sum4(part, lane);
+        const int j = t_idx * 16 + lt;
+        if (lane < 16 && j < max_model_len)
+            out_row[j] = (j <= limit) ? part : NEG_INF;
+    };
+
+    const int it0 = tile_start + warp;
+    int4v Kc[UNR]; int Sc[UNR];
+#pragma unroll
+    for (int u = 0; u < UNR; ++u) {
+        const int t = it0 + u * NW;
+        if (t < tile_end) gather(t, Kc[u], Sc[u]);
+    }
+    for (int it = it0; it < tile_end; it += UNR * NW) {
+        int4v Kn[UNR]; int Sn[UNR];
+#pragma unroll
+        for (int u = 0; u < UNR; ++u) {
+            const int t = it + (UNR + u) * NW;
+            if (t < tile_end) gather(t, Kn[u], Sn[u]);
+        }
+#pragma unroll
+        for (int u = 0; u < UNR; ++u) {
+            const int t = it + u * NW;
+            if (t < tile_end) compute(t, Kc[u], Sc[u]);
+        }
+#pragma unroll
+        for (int u = 0; u < UNR; ++u) { Kc[u] = Kn[u]; Sc[u] = Sn[u]; }
     }
 }
 
@@ -738,12 +915,18 @@ extern "C" void launch_fp4_pa_mqa_fused(
     else if (H == 128 && N == 1) launch(fp4_pa_mqa_fused_kernel<128, 1>);
 }
 
+// layout: 0 = interleaved (non-preshuffle, per-token fused cache; KVBlockSize==1),
+//         1 = segregated  (non-preshuffle paged, block_size tokens/physical block),
+//         2 = preshuffle  (FP8-gluon preshuffle layout, block_size multiple of 16).
+// block_size / blk_stride are only consulted for layout 1 and 2; blk_stride is the
+// per-physical-block byte stride (= kv_cache.stride(0), vLLM page padding included).
 extern "C" void launch_fp4_pa_mqa(
     const uint8_t* q_p, const uint8_t* q_s, const uint8_t* kv,
     const int* block_tables, const float* weights, float* out,
     const int* context_lens,
     int B, int N, int H, int max_model_len, int max_block_len,
-    int kv_stride, int split_kv, long stream)
+    int kv_stride, int split_kv, int layout, int block_size, int blk_stride,
+    long stream)
 {
     dim3 grid(B * N * split_kv);
     dim3 block(WARPS * LANES);
@@ -751,11 +934,65 @@ extern "C" void launch_fp4_pa_mqa(
     auto launch = [&](auto kern) {
         kern<<<grid, block, 0, s>>>(
             q_p, q_s, kv, block_tables, weights, out, context_lens,
-            B, N, max_model_len, max_block_len, kv_stride, split_kv);
+            B, N, max_model_len, max_block_len, kv_stride, split_kv,
+            block_size, blk_stride);
     };
-    if (H == 64)      launch(fp4_pa_mqa_kernel<64>);
-    else if (H == 32) launch(fp4_pa_mqa_kernel<32>);
-    else if (H == 128) launch(fp4_pa_mqa_kernel<128>);
+    if (layout == LAYOUT_PRESHUFFLE) {
+        // Dedicated preshuffle kernel for the common compile-time block sizes;
+        // fall back to the generic preshuffle branch for other block sizes.
+        // UNR (pipeline depth = # of outstanding KV loads per warp) is the main
+        // knob for hitting HBM peak in this latency-bound decode kernel; it is
+        // overridable via FP4_PS_UNROLL for tuning.
+        const char* eu = getenv("FP4_PS_UNROLL");
+        const char* ew = getenv("FP4_PS_WARPS");
+        const int unr = eu ? atoi(eu) : 2;   // pipeline depth (regs); 2 is best
+        // 8 warps/CTA maximizes memory-level parallelism and is the best choice
+        // once each CTA has enough tiles to keep them busy; for small per-CTA
+        // tile counts the extra warps just add tail/overhead, so fall back to 4.
+        const long tiles_total = (long)max_block_len * block_size / 16;
+        const int tiles_per_cta = (int)(tiles_total / (split_kv > 0 ? split_kv : 1));
+        const int nw = ew ? atoi(ew) : (tiles_per_cta >= 24 ? 8 : 4);
+        auto launch_ps = [&](auto kern, int nwarps) {
+            dim3 blk(nwarps * LANES);
+            kern<<<grid, blk, 0, s>>>(
+                q_p, q_s, kv, block_tables, weights, out, context_lens,
+                B, N, max_model_len, max_block_len, kv_stride, split_kv,
+                block_size, blk_stride);
+        };
+#define FP4_PS_BY_H(BS, U, W)                                                       \
+        do {                                                                       \
+            if (H == 64) launch_ps(fp4_pa_mqa_preshuffle_kernel<64, BS, U, W>, W); \
+            else if (H == 32) launch_ps(fp4_pa_mqa_preshuffle_kernel<32, BS, U, W>, W); \
+            else if (H == 128) launch_ps(fp4_pa_mqa_preshuffle_kernel<128, BS, U, W>, W); \
+        } while (0)
+#define FP4_PS_BY_U(BS, W)                                                          \
+        do {                                                                       \
+            if (unr >= 4) FP4_PS_BY_H(BS, 4, W); else FP4_PS_BY_H(BS, 2, W);        \
+        } while (0)
+#define FP4_PS_DISPATCH(BS)                                                         \
+        do {                                                                       \
+            if (nw >= 8) FP4_PS_BY_U(BS, 8); else FP4_PS_BY_U(BS, 4);               \
+        } while (0)
+        if (block_size == 16)      FP4_PS_DISPATCH(16);
+        else if (block_size == 32) FP4_PS_DISPATCH(32);
+        else if (block_size == 64) FP4_PS_DISPATCH(64);
+        else {
+            if (H == 64)       launch(fp4_pa_mqa_kernel<64, LAYOUT_PRESHUFFLE>);
+            else if (H == 32)  launch(fp4_pa_mqa_kernel<32, LAYOUT_PRESHUFFLE>);
+            else if (H == 128) launch(fp4_pa_mqa_kernel<128, LAYOUT_PRESHUFFLE>);
+        }
+#undef FP4_PS_DISPATCH
+#undef FP4_PS_BY_U
+#undef FP4_PS_BY_H
+    } else if (layout == LAYOUT_SEGREGATED) {
+        if (H == 64)       launch(fp4_pa_mqa_kernel<64, LAYOUT_SEGREGATED>);
+        else if (H == 32)  launch(fp4_pa_mqa_kernel<32, LAYOUT_SEGREGATED>);
+        else if (H == 128) launch(fp4_pa_mqa_kernel<128, LAYOUT_SEGREGATED>);
+    } else {
+        if (H == 64)       launch(fp4_pa_mqa_kernel<64, LAYOUT_INTERLEAVED>);
+        else if (H == 32)  launch(fp4_pa_mqa_kernel<32, LAYOUT_INTERLEAVED>);
+        else if (H == 128) launch(fp4_pa_mqa_kernel<128, LAYOUT_INTERLEAVED>);
+    }
 }
 
 // ==========================================================================
@@ -956,7 +1193,18 @@ __global__ void fp4_mqa_dense32_kernel(
     const float*   w_base   = weights + (size_t)m * HEADS;
     int4v qreg[HT2][2];                   // [head-tile][MFMA k-step]
     int   qscale[HT2][2];
+#if defined(FP4_DENSE_PIPE)
+    // Pipelined variant: stage the row's HEADS weights in (otherwise-idle) LDS
+    // instead of 32 per-lane VGPR. Freeing those registers is what lets the
+    // group-pipeline below keep two MFMA accumulators (prev/cur) live so tile
+    // u+1's MFMA overlaps tile u's relu-reduction.
+    __shared__ float w_lds[HEADS];
+    for (int i = threadIdx.x; i < HEADS; i += WARPS * LANES)
+        w_lds[i] = w_base[i];
+    __syncthreads();
+#else
     float wreg[HT2][16];                  // weight per (head-tile, acc slot e)
+#endif
 #pragma unroll
     for (int ht = 0; ht < HT2; ++ht) {
         const int head = 32 * ht + rc;
@@ -969,11 +1217,13 @@ __global__ void fp4_mqa_dense32_kernel(
         qreg[ht][1]   = load16v4(qb + 16);
         qscale[ht][0] = (int)q_s_base[(size_t)head * DS + 2 * hi];
         qscale[ht][1] = (int)q_s_base[(size_t)head * DS + 2 * hi + 1];
+#if !defined(FP4_DENSE_PIPE)
 #pragma unroll
         for (int e = 0; e < 16; ++e) {
             const int hd = 32 * ht + 8 * (e >> 2) + 4 * hi + (e & 3);
             wreg[ht][e] = w_base[hd];
         }
+#endif
     }
     float* out_row = out + (size_t)m * out_stride;
 
@@ -988,6 +1238,57 @@ __global__ void fp4_mqa_dense32_kernel(
         s1 = (int)ksc[2 * hi + 1];
     };
 
+#if defined(FP4_DENSE_PIPE)
+    // ---- group-pipelined path: overlap reduce(group u) with MFMA(group u+1) ----
+    // Each tile has HT2 MFMA-groups (one per 32-head tile). We issue group g+1's
+    // MFMAs, then run group g's relu-reduction while those MFMAs are in flight on
+    // the matrix pipe (VALU and matrix pipes run concurrently). Weights come from
+    // LDS (w_lds), which is what freed the VGPRs to keep two acc's (prev/cur) live.
+    auto mfma_group = [&](int ht, int8v K0, int8v K1, int s0, int s1) -> float16v {
+        float16v acc;
+#pragma unroll
+        for (int e = 0; e < 16; ++e) acc[e] = 0.f;
+        acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+            widen(qreg[ht][0]), K0, acc, 4, 4, 0, qscale[ht][0], 0, s0);
+        acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+            widen(qreg[ht][1]), K1, acc, 4, 4, 0, qscale[ht][1], 0, s1);
+        return acc;
+    };
+    float pp0 = 0.f, pp1 = 0.f, pp2 = 0.f, pp3 = 0.f;  // current tile's partial
+    auto reduce_group = [&](int t_idx, int ht, const float16v& acc) {
+        if (ht == 0) { pp0 = pp1 = pp2 = pp3 = 0.f; }
+#pragma unroll
+        for (int e = 0; e < 16; e += 4) {
+            pp0 += fmaxf(acc[e + 0], 0.0f) * w_lds[32 * ht + 8 * (e >> 2) + 4 * hi + 0];
+            pp1 += fmaxf(acc[e + 1], 0.0f) * w_lds[32 * ht + 8 * (e >> 2) + 4 * hi + 1];
+            pp2 += fmaxf(acc[e + 2], 0.0f) * w_lds[32 * ht + 8 * (e >> 2) + 4 * hi + 2];
+            pp3 += fmaxf(acc[e + 3], 0.0f) * w_lds[32 * ht + 8 * (e >> 2) + 4 * hi + 3];
+        }
+        if (ht == HT2 - 1) {
+            float part = (pp0 + pp1) + (pp2 + pp3);
+            part += __shfl_xor(part, 32);
+            const int n = t_idx * BN + rc;
+            if (lane < 32 && n >= ks && n < ke) out_row[n] = part;
+        }
+    };
+
+    const int it0 = tile_start + warp;
+    float16v acc_prev;
+    int prev_t = -1, prev_ht = -1;
+    int4v Kc0, Kc1; int Sc0, Sc1;
+    for (int t = it0; t < tile_end; t += WARPS) {
+        gather(t, Kc0, Kc1, Sc0, Sc1);
+        const int8v K0 = widen(Kc0), K1 = widen(Kc1);
+#pragma unroll
+        for (int ht = 0; ht < HT2; ++ht) {
+            const float16v acc_cur = mfma_group(ht, K0, K1, Sc0, Sc1);  // matrix pipe
+            if (prev_ht >= 0) reduce_group(prev_t, prev_ht, acc_prev);  // VALU overlaps
+            acc_prev = acc_cur; prev_t = t; prev_ht = ht;
+        }
+    }
+    if (prev_ht >= 0) reduce_group(prev_t, prev_ht, acc_prev);
+#else
+
     auto compute = [&](int t_idx, int4v b0, int4v b1, int s0, int s1) {
         const int8v K0 = widen(b0), K1 = widen(b1);
         float part = 0.0f;
@@ -995,9 +1296,13 @@ __global__ void fp4_mqa_dense32_kernel(
         // load-only: isolate pure KV read BW (no MFMA, no reduction)
         part = (float)(b0[0]^b0[1]^b0[2]^b0[3]^b1[0]^b1[1]^b1[2]^b1[3]^s0^s1);
 #else
-        // 4 independent accumulators: FP add is non-associative, so a single
-        // `part +=` chain would be a 32-deep serial dependency. Folding into 4
-        // parallel chains (gluon-style) cuts the relu/weight critical path ~4x.
+        // Reduction over heads: logit = sum_h relu(qk[h]) * w[h]. Profiled as the
+        // kernel's dominant exposed cost: the epilogue is 64 VALU/tile (32 v_max
+        // relu + 32 fma); the MFMA hides ~half, and the relu (~389us at 8192x32768)
+        // is the exposed remainder. gfx950 has no packed-f32 max so relu can't be
+        // packed; 4 independent accumulators (FP add is non-associative) keep ILP
+        // and avoid a 32-deep serial dependency. (A packed-f32 v_pk_fma variant and
+        // 8-chain variant were both measured slightly SLOWER.)
         float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
 #pragma unroll
         for (int ht = 0; ht < HT2; ++ht) {
@@ -1054,6 +1359,7 @@ __global__ void fp4_mqa_dense32_kernel(
             Kc0[u] = Kn0[u]; Kc1[u] = Kn1[u]; Sc0[u] = Sn0[u]; Sc1[u] = Sn1[u];
         }
     }
+#endif  // FP4_DENSE_PIPE
 }
 
 extern "C" void launch_fp4_mqa_dense32(

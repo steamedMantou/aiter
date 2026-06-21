@@ -35,7 +35,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DWARPS=4'",
-            "'-O3'"
+            "'-O3'",
+            "'-DFP4_DENSE_PIPE'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

@@ -29,13 +29,21 @@ torch::Tensor fp4_mqa_logits(torch::Tensor& q_p,
                              int64_t split_kv,
                              int64_t core);
 
-// Paged MXFP4 MQA-logits (KV block_size == 1).
+// Paged MXFP4 MQA-logits. Two KV-cache layouts, matching the FP8 "gluon"
+// deepgemm_fp8_paged_mqa_logits input layout (selected by `layout`):
+//   layout 0 (interleaved, non-preshuffle, KVBlockSize==1): per-token fused 80B
+//     rows, block_tables[b,j] is a per-token slot, tok(j) = block_tables[b,j].
+//     kv_cache [num_blocks, 80] u8 (fused e2m1|e8m0|pad).
+//   layout 1 (segregated, non-preshuffle, KVBlockSize>1): paged cache, per
+//     physical block [block_size*D/2 e2m1 | block_size*D/32 e8m0 | pad];
+//     block_tables[b, j/block_size] maps logical->physical, blk_stride = bytes
+//     per physical block (= kv_cache.stride(0), page padding included).
+//   layout 2 (preshuffle, KVBlockSize multiple of 16): the FP8-gluon preshuffle
+//     layout; same per-block block_tables/blk_stride, data region swizzled.
 //   logits[b*N+n, j] = sum_h relu(Q[b,n,h,:] . K[tok(j),:]) * w[b*N+n,h]
-//   for j <= context_lens[b] - N + n, else left untouched, with
-//   tok(j) = block_tables[b, j].
-// q_p [B,N,H,D/2] u8, q_s [B,N,H,D/32] u8, kv_cache [num_blocks, 80] u8 (fused
-// e2m1|e8m0|pad), block_tables [B, max_block_len] i32, weights [B*N,H] f32,
-// context_lens [B] i32, out_logits [B*N, max_model_len] f32 (written here).
+//   for j <= context_lens[b] - N + n, else left untouched.
+// q_p [B,N,H,D/2] u8, q_s [B,N,H,D/32] u8, block_tables [B, max_block_len] i32,
+// weights [B*N,H] f32, context_lens [B] i32, out_logits [B*N, max_model_len] f32.
 torch::Tensor fp4_paged_mqa_logits(torch::Tensor& q_p,
                                    torch::Tensor& q_s,
                                    torch::Tensor& kv_cache,
@@ -44,6 +52,9 @@ torch::Tensor fp4_paged_mqa_logits(torch::Tensor& q_p,
                                    torch::Tensor& context_lens,
                                    torch::Tensor& out_logits,
                                    int64_t max_model_len,
-                                   int64_t split_kv);
+                                   int64_t split_kv,
+                                   int64_t layout,
+                                   int64_t block_size,
+                                   int64_t blk_stride);
 
 } // namespace aiter

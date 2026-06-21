@@ -21,6 +21,14 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from .shuffle import shuffle_weight
+
+# KV-cache layout codes (must match the `layout` switch in
+# csrc/py_itfs_cu/fp4_mqa_logits.cu / launch_fp4_pa_mqa). They mirror the two
+# input layouts the FP8 "gluon" deepgemm_fp8_paged_mqa_logits accepts.
+LAYOUT_INTERLEAVED = 0  # non-preshuffle, KVBlockSize == 1 (per-token fused rows)
+LAYOUT_SEGREGATED = 1  # non-preshuffle, KVBlockSize > 1 (paged data|scale block)
+LAYOUT_PRESHUFFLE = 2  # preshuffle, KVBlockSize multiple of 16 (swizzled data)
 
 MD_NAME = "module_fp4_mqa_logits"
 
@@ -77,6 +85,9 @@ def _fp4_paged_mqa_logits(
     out_logits: Tensor,
     max_model_len: int,
     split_kv: int,
+    layout: int,
+    block_size: int,
+    blk_stride: int,
 ) -> Tensor: ...
 
 
@@ -143,21 +154,64 @@ def fp4_mqa_logits(
     )
 
 
-def make_fp4_kv_cache(kv_p, kv_s):
-    """Pack MXFP4 KV planes into the 16B-aligned fused cache the paged kernel reads.
+def make_fp4_kv_cache(kv_p, kv_s, block_size=1, preshuffle=False):
+    """Pack MXFP4 KV planes into the fused paged cache the FP4 paged kernel reads.
 
-    kv_p: [num_blocks, HEAD_SIZE // 2],  uint8 (e2m1 data)
-    kv_s: [num_blocks, HEAD_SIZE // 32], uint8 (e8m0 scale)
-    returns: [num_blocks, KV_STRIDE] uint8 (data | scale | pad), contiguous.
+    The output layout mirrors the FP8 "gluon" paged cache (see
+    ``bench_deepgemm_attention.kv_cache_cast_to_fp8``): each physical block holds
+    a contiguous data region followed by a contiguous scale region (then pad).
+
+    kv_p: [num_tokens, HEAD_SIZE // 2],  uint8 (e2m1 data)
+    kv_s: [num_tokens, HEAD_SIZE // 32], uint8 (e8m0 scale)
+
+    block_size == 1 and not preshuffle (default): returns the per-token fused
+      cache ``[num_blocks, KV_STRIDE]`` uint8 (``[data | scale | pad]``). Use with
+      the interleaved (non-preshuffle) layout and per-token ``block_tables``.
+
+    block_size > 1 (segregated) or preshuffle: returns the paged cache
+      ``[num_blocks, block_size, 1, index_dim]`` uint8 (``index_dim`` padded so
+      the block is 16B-aligned), laid out per physical block as
+      ``[block_size*D/2 e2m1 | block_size*D/32 e8m0 | pad]``. For preshuffle
+      (``block_size`` multiple of 16) the data region is swizzled by
+      ``shuffle_weight(layout=(16, 16))`` exactly like the FP8 preshuffle cache.
+      Use with per-block ``block_tables``.
     """
-    num_blocks, dp = kv_p.shape
+    num_tokens, dp = kv_p.shape
     ds = kv_s.shape[1]
-    fused = torch.zeros(
-        (num_blocks, KV_STRIDE), dtype=torch.uint8, device=kv_p.device
+
+    if block_size == 1 and not preshuffle:
+        fused = torch.zeros(
+            (num_tokens, KV_STRIDE), dtype=torch.uint8, device=kv_p.device
+        )
+        fused[:, :dp] = kv_p
+        fused[:, dp : dp + ds] = kv_s
+        return fused.contiguous()
+
+    assert (
+        num_tokens % block_size == 0
+    ), f"num_tokens {num_tokens} must be a multiple of block_size {block_size}"
+    if preshuffle:
+        assert (
+            block_size % 16 == 0
+        ), f"preshuffle requires block_size multiple of 16, got {block_size}"
+    num_blocks = num_tokens // block_size
+
+    # Per-token padding so the scale region (and thus the block) is 16B-aligned,
+    # matching the FP8 gluon cache builder (index_dim = data + scale + pad).
+    padding = (16 - (block_size * ds) % 16) % 16
+    index_dim = dp + ds + padding
+    row = block_size * index_dim
+
+    data = kv_p.view(num_blocks, block_size, dp).contiguous()
+    if preshuffle:
+        data = shuffle_weight(data, layout=(16, 16))
+
+    fused = torch.zeros((num_blocks, row), dtype=torch.uint8, device=kv_p.device)
+    fused[:, : block_size * dp] = data.reshape(num_blocks, block_size * dp)
+    fused[:, block_size * dp : block_size * dp + block_size * ds] = kv_s.reshape(
+        num_blocks, block_size * ds
     )
-    fused[:, :dp] = kv_p
-    fused[:, dp : dp + ds] = kv_s
-    return fused.contiguous()
+    return fused.view(num_blocks, block_size, 1, index_dim).contiguous()
 
 
 def fp4_paged_mqa_logits(
@@ -170,30 +224,64 @@ def fp4_paged_mqa_logits(
     block_tables,
     max_model_len,
     split_kv=None,
+    preshuffle=False,
+    kv_block_size=1,
 ):
-    """Paged MXFP4 MQA-logits (KV block_size == 1).
+    """Paged MXFP4 MQA-logits, aligned with the FP8 "gluon"
+    ``deepgemm_fp8_paged_mqa_logits`` input layout. Two KV-cache layouts are
+    selected by ``preshuffle`` / ``kv_block_size``:
+
+      Non-preshuffle (``preshuffle=False``):
+        * ``kv_block_size == 1`` (default): interleaved per-token fused cache
+          ``[num_blocks, 80]`` (also accepts ``[num_blocks, 1, 1, 80]``).
+          ``block_tables[b, j]`` is a per-token slot, ``tok(j) = block_tables[b, j]``.
+        * ``kv_block_size > 1``: segregated paged cache
+          ``[num_blocks, kv_block_size, 1, index_dim]`` from ``make_fp4_kv_cache``.
+          ``block_tables[b, j // kv_block_size]`` maps logical->physical block.
+
+      Preshuffle (``preshuffle=True``, ``kv_block_size`` multiple of 16): the
+        FP8-gluon preshuffle paged cache from
+        ``make_fp4_kv_cache(..., preshuffle=True)``. Per-block ``block_tables``.
 
     Computes logits[b*N+n, j] = sum_h relu(Q[b,n,h,:] . K[tok(j),:]) * w[b*N+n,h]
-    for j <= context_lens[b] - N + n, else -inf, with tok(j) = block_tables[b, j].
+    for j <= context_lens[b] - N + n, else -inf.
 
     q_p:          [batch, next_n, NUM_HEADS, HEAD_SIZE // 2],  uint8
     q_s:          [batch, next_n, NUM_HEADS, HEAD_SIZE // 32], uint8
-    kv_cache_fp4: fused MXFP4 cache from `make_fp4_kv_cache`, [num_blocks, 80]
-                  (also accepts [num_blocks, 1, 1, 80] and flattens it).
     weights:      [batch * next_n, NUM_HEADS], float32
     out_logits:   [batch * next_n, max_model_len], float32 (pre-filled with -inf)
     context_lens: [batch], int32
-    block_tables: [batch, max_block_len], int32 (paged token indices)
+    block_tables: [batch, max_block_len], int32
     max_model_len: int
     split_kv:     optional kv-split factor (None -> graph-stable heuristic).
+    preshuffle:   use the FP8-gluon preshuffle KV layout.
+    kv_block_size: tokens per physical block (>1 -> segregated/preshuffle).
 
     Returns out_logits (written in place).
     """
     kv = kv_cache_fp4
-    if kv.dim() > 2:
-        kv = kv.reshape(kv.shape[0], -1)
-    if not kv.is_contiguous():
-        kv = kv.contiguous()
+    if preshuffle:
+        layout = LAYOUT_PRESHUFFLE
+    elif kv_block_size > 1:
+        layout = LAYOUT_SEGREGATED
+    else:
+        layout = LAYOUT_INTERLEAVED
+
+    if layout == LAYOUT_INTERLEAVED:
+        # interleaved: flatten to [num_blocks, 80] contiguous; per-token block_tables.
+        if kv.dim() > 2:
+            kv = kv.reshape(kv.shape[0], -1)
+        if not kv.is_contiguous():
+            kv = kv.contiguous()
+        block_size = 0
+        blk_stride = 0
+    else:
+        # segregated / preshuffle: address via blk_stride (per physical block bytes).
+        if not kv.is_contiguous():
+            kv = kv.contiguous()
+        block_size = int(kv_block_size)
+        blk_stride = int(kv.stride(0))  # uint8 -> stride is in bytes
+
     batch, next_n = q_p.shape[0], q_p.shape[1]
     if split_kv is None:
         split_kv = pick_split_kv(batch, next_n)
@@ -207,4 +295,7 @@ def fp4_paged_mqa_logits(
         out_logits,
         int(max_model_len),
         int(split_kv),
+        int(layout),
+        int(block_size),
+        int(blk_stride),
     )

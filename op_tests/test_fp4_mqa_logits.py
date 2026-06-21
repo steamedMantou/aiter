@@ -276,6 +276,144 @@ def masked_diff_paged(out_logits, ref, p: PagedProblem):
 
 
 # ===========================================================================
+# Blocked paged problem (FP8-gluon aligned: segregated / preshuffle layouts).
+# Tokens are grouped into physical blocks of `block_size`; block_tables map
+# logical->physical block (granularity = block_size tokens).
+# ===========================================================================
+@dataclass
+class BlockedPagedProblem:
+    batch: int
+    next_n: int
+    heads: int
+    dim: int
+    block_size: int
+    max_model_len: int
+    weights: torch.Tensor
+    context_lens: torch.Tensor
+    block_tables: torch.Tensor       # [batch, max_block_len] physical block ids
+    q_p: torch.Tensor
+    q_s: torch.Tensor
+    kv_p: torch.Tensor               # [num_blocks*block_size, dim//2] block-major
+    kv_s: torch.Tensor               # [num_blocks*block_size, dim//32]
+    q_deq: torch.Tensor
+    kv_deq: torch.Tensor             # [num_blocks*block_size, dim] dequantized
+
+
+def make_blocked_paged_problem(
+    batch, next_n, heads, dim, avg_kv_length, block_size, var_ratio=0.5, seed=0
+):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    assert dim % 32 == 0 and block_size % 16 == 0
+    device = "cuda"
+    max_model_len = 2 * avg_kv_length
+
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int((1 + var_ratio) * avg_kv_length) + 1,
+        (batch,),
+        device=device,
+    ).to(torch.int32)
+
+    max_logical_blocks = (max_model_len + block_size - 1) // block_size
+    num_blocks = batch * max_logical_blocks + 1  # pool of physical blocks
+
+    q = torch.randn((batch, next_n, heads, dim), device=device, dtype=torch.bfloat16)
+    kv = torch.randn(
+        (num_blocks * block_size, dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch * next_n, heads), device=device, dtype=torch.float32)
+
+    max_block_len = (
+        (int(context_lens.max().item()) + block_size - 1) // block_size
+    )
+    block_tables = torch.zeros((batch, max_block_len), device=device, dtype=torch.int32)
+    pool = torch.randperm(num_blocks, device=device, dtype=torch.int32)
+    counter = 0
+    for i in range(batch):
+        nblk = (int(context_lens[i].item()) + block_size - 1) // block_size
+        for j in range(nblk):
+            block_tables[i, j] = pool[counter % num_blocks]
+            counter += 1
+
+    q_p, q_s = quant_mxfp4_rowwise(q.reshape(-1, dim).float())
+    q_p = q_p.view(batch, next_n, heads, dim // 2)
+    q_s = q_s.view(batch, next_n, heads, dim // 32)
+    q_deq = dequant_mxfp4_rowwise(
+        q_p.reshape(-1, dim // 2), q_s.reshape(-1, dim // 32)
+    ).view(batch, next_n, heads, dim)
+    kv_p, kv_s = quant_mxfp4_rowwise(kv.float())
+    kv_deq = dequant_mxfp4_rowwise(kv_p, kv_s)
+
+    return BlockedPagedProblem(
+        batch, next_n, heads, dim, block_size, max_model_len, weights, context_lens,
+        block_tables, q_p, q_s, kv_p, kv_s, q_deq, kv_deq,
+    )
+
+
+@torch.no_grad()
+def ref_blocked_paged(p: BlockedPagedProblem, kv_chunk=8192):
+    B, N, H, D, bs = p.batch, p.next_n, p.heads, p.dim, p.block_size
+    q = p.q_deq
+    out = torch.full((B * N, p.max_model_len), float("-inf"),
+                     device=p.q_deq.device, dtype=torch.float32)
+    ctx_list = p.context_lens.tolist()
+    for i in range(B):
+        ctx = ctx_list[i]
+        if ctx <= 0:
+            continue
+        j = torch.arange(ctx, device="cuda")
+        phys = p.block_tables[i, (j // bs).long()].long()
+        rows = phys * bs + (j % bs)
+        K = p.kv_deq[rows]
+        w = p.weights[i * N : (i + 1) * N]
+        for n in range(N):
+            qx = q[i, n]
+            limit = ctx - N + n
+            row = out[i * N + n]
+            for c0 in range(0, ctx, kv_chunk):
+                c1 = min(ctx, c0 + kv_chunk)
+                s = (qx[:, None, :] * K[c0:c1][None, :, :]).sum(-1)
+                s = (torch.relu(s) * w[n][:, None]).sum(0)
+                jj = torch.arange(c0, c1, device=s.device)
+                row[c0:c1] = torch.where(
+                    jj <= limit, s, torch.full_like(s, float("-inf"))
+                )
+    return out
+
+
+def masked_diff_blocked(out_logits, ref, p: BlockedPagedProblem):
+    mml = p.max_model_len
+    positions = torch.arange(mml, device=out_logits.device).unsqueeze(0).expand(
+        p.batch * p.next_n, -1
+    )
+    row_idx = torch.arange(p.batch * p.next_n, device=out_logits.device) // p.next_n
+    nn_off = torch.arange(p.batch * p.next_n, device=out_logits.device) % p.next_n
+    limits = (p.context_lens[row_idx] - p.next_n + nn_off).unsqueeze(1)
+    mask = positions <= limits
+    return calc_diff(out_logits.masked_fill(~mask, 0), ref.masked_fill(~mask, 0))
+
+
+@torch.inference_mode()
+def compare_paged_blocked(B, N, H, D, kv_length, block_size, preshuffle, seed=0):
+    p = make_blocked_paged_problem(B, N, H, D, kv_length, block_size, seed=seed)
+    ref_fp4 = ref_blocked_paged(p)
+
+    kv_cache = make_fp4_kv_cache(
+        p.kv_p, p.kv_s, block_size=block_size, preshuffle=preshuffle
+    )
+    out_fp4 = torch.full(
+        (B * N, p.max_model_len), float("-inf"), device="cuda", dtype=torch.float32
+    )
+    fp4_paged_mqa_logits(
+        p.q_p, p.q_s, kv_cache, p.weights, out_fp4, p.context_lens, p.block_tables,
+        p.max_model_len, preshuffle=preshuffle, kv_block_size=block_size,
+    )
+    torch.cuda.synchronize()
+    return masked_diff_blocked(out_fp4, ref_fp4, p)
+
+
+# ===========================================================================
 # Timing: device-time per call via CUDA-graph replay (removes launch overhead).
 # ===========================================================================
 def bench_us(fn, iters=100, warmup=20):
@@ -442,6 +580,19 @@ def test_fp4_paged_mqa_logits(B, N, H, kv_length):
     r = compare_paged(B, N, H, 128, kv_length, do_perf=False)
     assert r["d_fp4_fp4"] < 1e-3, f"FP4 paged vs fp4-ref too large: {r['d_fp4_fp4']}"
     assert r["d_fp4"] < 0.3, f"FP4 paged vs bf16 unexpectedly large: {r['d_fp4']}"
+
+
+# Both FP8-gluon-aligned KV layouts: segregated (preshuffle=False, block>1) and
+# preshuffle (preshuffle=True). Each must reproduce its exact fp4 dequant ref.
+@pytest.mark.parametrize("B, N, kv_length", [(1, 1, 2048), (2, 2, 4096), (2, 1, 8192)])
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("preshuffle", [False, True])
+@pytest.mark.parametrize("H", [64])
+@torch.inference_mode()
+def test_fp4_paged_mqa_logits_blocked(B, N, H, kv_length, block_size, preshuffle):
+    d = compare_paged_blocked(B, N, H, 128, kv_length, block_size, preshuffle)
+    tag = "preshuffle" if preshuffle else f"segregated(block={block_size})"
+    assert d < 1e-3, f"FP4 paged {tag} vs fp4-ref too large: {d}"
 
 
 # ===========================================================================

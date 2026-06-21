@@ -141,7 +141,10 @@ namespace py = pybind11;
           py::arg("context_lens"),                                     \
           py::arg("out_logits"),                                       \
           py::arg("max_model_len"),                                    \
-          py::arg("split_kv"));
+          py::arg("split_kv"),                                         \
+          py::arg("layout"),                                           \
+          py::arg("block_size"),                                       \
+          py::arg("blk_stride"));
 
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
