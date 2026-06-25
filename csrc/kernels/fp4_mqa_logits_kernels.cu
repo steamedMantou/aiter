@@ -1362,6 +1362,167 @@ __global__ void fp4_mqa_dense32_kernel(
 #endif  // FP4_DENSE_PIPE
 }
 
+// ==========================================================================
+// M-tiled dense MXFP4 MQA-logits, 32x32x64 core (CDNA4)
+// --------------------------------------------------------------------------
+// In the dominant dense case (M=2048, Nkv=8192) every one of the M blocks of
+// fp4_mqa_dense32_kernel independently streams the ENTIRE KV (Nkv*68 bytes).
+// KV is identical across all M rows, so that traffic is M-fold redundant and
+// is the binding cost once KV no longer fits in L2.
+//
+// This variant processes MROWS consecutive m-rows per block: each K tile is
+// gathered ONCE (shared registers Kc0/Kc1) and fed into MROWS independent MFMA
+// reductions, cutting KV global traffic by MROWS x. Q/weights for the MROWS
+// rows live in registers (loaded once, reused over all tiles); the K registers
+// stay shared, so register growth is only in the (small) per-row Q/acc state.
+template <int HEADS, int MROWS>
+__global__ void fp4_mqa_dense32_mtile_kernel(
+    const uint8_t* __restrict__ q_p,        // [M, H, D/2]
+    const uint8_t* __restrict__ q_s,        // [M, H, D/32]
+    const uint8_t* __restrict__ kv_p,       // [Nkv, D/2]
+    const uint8_t* __restrict__ kv_s,       // [Nkv, D/32]
+    const float*   __restrict__ weights,    // [M, H]
+    const int*     __restrict__ cu_starts,  // [M]
+    const int*     __restrict__ cu_ends,    // [M]
+    float*         __restrict__ out,        // [M, Nkv]  (pre-filled -inf)
+    int M, int Nkv, int kv_p_stride, int kv_s_stride, int out_stride, int split_kv)
+{
+    constexpr int DP = 64, DS = 4, HT2 = HEADS / 32;  // 32-head tiles
+    constexpr int BN = 32;                            // tokens per tile
+
+    const int num_mb = (M + MROWS - 1) / MROWS;
+    const int pid    = blockIdx.x;
+    const int mb     = pid % num_mb;
+    const int split  = pid / num_mb;
+    const int m_base = mb * MROWS;
+    const int nrows  = min(MROWS, M - m_base);
+    if (nrows <= 0) return;
+
+    // Union tile range over the block's rows (per-row store mask keeps it exact).
+    int ks_min = cu_starts[m_base], ke_max = cu_ends[m_base];
+#pragma unroll
+    for (int r = 1; r < MROWS; ++r) {
+        if (r < nrows) {
+            ks_min = min(ks_min, cu_starts[m_base + r]);
+            ke_max = max(ke_max, cu_ends[m_base + r]);
+        }
+    }
+    if (ks_min >= ke_max) return;
+
+    const int t_lo = ks_min >> 5;
+    const int t_hi = (ke_max + 31) >> 5;
+    const int total_tiles = t_hi - t_lo;
+    const int tiles_per_split = (total_tiles + split_kv - 1) / split_kv;
+    const int tile_start = t_lo + split * tiles_per_split;
+    const int tile_end   = min(tile_start + tiles_per_split, t_hi);
+    if (tile_start >= tile_end) return;
+
+    const int warp = threadIdx.x / LANES;
+    const int lane = threadIdx.x % LANES;
+    const int rc   = lane & 31;
+    const int hi   = lane >> 5;
+
+    // Q + scales + weights for the MROWS rows, loaded once, reused over tiles.
+    int4v qreg[MROWS][HT2][2];
+    int   qscale[MROWS][HT2][2];
+    float wreg[MROWS][HT2][16];
+    int   ks_r[MROWS], ke_r[MROWS];
+#pragma unroll
+    for (int r = 0; r < MROWS; ++r) {
+        const int m = (r < nrows) ? (m_base + r) : m_base;
+        ks_r[r] = cu_starts[m];
+        ke_r[r] = cu_ends[m];
+        const uint8_t* q_p_base = q_p + (size_t)m * HEADS * DP;
+        const uint8_t* q_s_base = q_s + (size_t)m * HEADS * DS;
+        const float*   w_base   = weights + (size_t)m * HEADS;
+#pragma unroll
+        for (int ht = 0; ht < HT2; ++ht) {
+            const int head = 32 * ht + rc;
+            const uint8_t* qb = q_p_base + (size_t)head * DP + 32 * hi;
+            qreg[r][ht][0]   = load16v4(qb);
+            qreg[r][ht][1]   = load16v4(qb + 16);
+            qscale[r][ht][0] = (int)q_s_base[(size_t)head * DS + 2 * hi];
+            qscale[r][ht][1] = (int)q_s_base[(size_t)head * DS + 2 * hi + 1];
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const int hd = 32 * ht + 8 * (e >> 2) + 4 * hi + (e & 3);
+                wreg[r][ht][e] = w_base[hd];
+            }
+        }
+    }
+
+    auto gather = [&](int t_idx, int4v& b0, int4v& b1, int& s0, int& s1) {
+        const int n  = t_idx * BN + rc;
+        const int nn = (n < Nkv) ? n : 0;
+        const uint8_t* kp  = kv_p + (size_t)nn * kv_p_stride + 32 * hi;
+        const uint8_t* ksc = kv_s + (size_t)nn * kv_s_stride;
+        b0 = load16v4(kp);
+        b1 = load16v4(kp + 16);
+        s0 = (int)ksc[2 * hi];
+        s1 = (int)ksc[2 * hi + 1];
+    };
+
+    auto compute = [&](int t_idx, int4v kb0, int4v kb1, int s0, int s1) {
+        const int8v K0 = widen(kb0), K1 = widen(kb1);
+        const int n = t_idx * BN + rc;
+#pragma unroll
+        for (int r = 0; r < MROWS; ++r) {
+            float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+#pragma unroll
+            for (int ht = 0; ht < HT2; ++ht) {
+                float16v acc;
+#pragma unroll
+                for (int e = 0; e < 16; ++e) acc[e] = 0.f;
+                acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+                    widen(qreg[r][ht][0]), K0, acc, 4, 4, 0, qscale[r][ht][0], 0, s0);
+                acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+                    widen(qreg[r][ht][1]), K1, acc, 4, 4, 0, qscale[r][ht][1], 0, s1);
+#pragma unroll
+                for (int e = 0; e < 16; e += 4) {
+                    p0 += fmaxf(acc[e + 0], 0.0f) * wreg[r][ht][e + 0];
+                    p1 += fmaxf(acc[e + 1], 0.0f) * wreg[r][ht][e + 1];
+                    p2 += fmaxf(acc[e + 2], 0.0f) * wreg[r][ht][e + 2];
+                    p3 += fmaxf(acc[e + 3], 0.0f) * wreg[r][ht][e + 3];
+                }
+            }
+            float part = (p0 + p1) + (p2 + p3);
+            part += __shfl_xor(part, 32);
+            if (r < nrows && lane < 32 && n >= ks_r[r] && n < ke_r[r])
+                out[(size_t)(m_base + r) * out_stride + n] = part;
+        }
+    };
+
+    // UNROLL-wide, 2-deep software pipeline, warp-strided tiles.
+    const int it0 = tile_start + warp;
+    int4v Kc0[UNROLL], Kc1[UNROLL]; int Sc0[UNROLL], Sc1[UNROLL];
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+        const int t = it0 + u * WARPS;
+        if (t < tile_end) gather(t, Kc0[u], Kc1[u], Sc0[u], Sc1[u]);
+    }
+    for (int it = it0; it < tile_end; it += UNROLL * WARPS) {
+        int4v Kn0[UNROLL], Kn1[UNROLL]; int Sn0[UNROLL], Sn1[UNROLL];
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int t = it + (UNROLL + u) * WARPS;
+            if (t < tile_end) gather(t, Kn0[u], Kn1[u], Sn0[u], Sn1[u]);
+        }
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int t = it + u * WARPS;
+            if (t < tile_end) compute(t, Kc0[u], Kc1[u], Sc0[u], Sc1[u]);
+        }
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            Kc0[u] = Kn0[u]; Kc1[u] = Kn1[u]; Sc0[u] = Sn0[u]; Sc1[u] = Sn1[u];
+        }
+    }
+}
+
+#ifndef FP4_DENSE_MTILE
+#define FP4_DENSE_MTILE 2   // m-rows fused per block in the dense32 path
+#endif
+
 extern "C" void launch_fp4_mqa_dense32(
     const uint8_t* q_p, const uint8_t* q_s,
     const uint8_t* kv_p, const uint8_t* kv_s,
@@ -1369,9 +1530,29 @@ extern "C" void launch_fp4_mqa_dense32(
     float* out, int M, int Nkv, int H,
     int kv_p_stride, int kv_s_stride, int out_stride, int split_kv, long stream)
 {
-    dim3 grid(M * split_kv);
-    dim3 block(WARPS * LANES);
     hipStream_t s = reinterpret_cast<hipStream_t>(stream);
+    dim3 block(WARPS * LANES);
+
+    // M-tiled path: amortize the (M-redundant) KV stream across MROWS rows.
+    // Only beneficial when the launch already saturates the machine (split_kv
+    // small) and there are enough rows to tile; otherwise fall back to 1 row.
+#if FP4_DENSE_MTILE > 1
+    if (split_kv == 1 && M >= FP4_DENSE_MTILE * 2) {
+        const int MR = FP4_DENSE_MTILE;
+        const int num_mb = (M + MR - 1) / MR;
+        dim3 grid(num_mb * split_kv);
+        auto launch_mt = [&](auto kern) {
+            kern<<<grid, block, 0, s>>>(
+                q_p, q_s, kv_p, kv_s, weights, cu_starts, cu_ends, out,
+                M, Nkv, kv_p_stride, kv_s_stride, out_stride, split_kv);
+        };
+        if (H == 64)       { launch_mt(fp4_mqa_dense32_mtile_kernel<64, FP4_DENSE_MTILE>);  return; }
+        else if (H == 32)  { launch_mt(fp4_mqa_dense32_mtile_kernel<32, FP4_DENSE_MTILE>);  return; }
+        else if (H == 128) { launch_mt(fp4_mqa_dense32_mtile_kernel<128, FP4_DENSE_MTILE>); return; }
+    }
+#endif
+
+    dim3 grid(M * split_kv);
     auto launch = [&](auto kern) {
         kern<<<grid, block, 0, s>>>(
             q_p, q_s, kv_p, kv_s, weights, cu_starts, cu_ends, out,
