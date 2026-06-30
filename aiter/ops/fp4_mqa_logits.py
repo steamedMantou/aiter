@@ -284,7 +284,15 @@ def fp4_paged_mqa_logits(
 
     batch, next_n = q_p.shape[0], q_p.shape[1]
     if split_kv is None:
-        split_kv = pick_split_kv(batch, next_n)
+        # Batch-aware, ctx-independent (graph-stable) KV fan-out:
+        #   small batch (<=16): target ~2 CTAs/CU. The old target=8 over-splits
+        #     so each CTA gets ~1 tile and idles 3/4 of its warps -- this was the
+        #     whole small-batch decode gap vs the FP8 gluon kernel.
+        #   large batch (>16): keep target=8. Here batch alone already fills the
+        #     CUs, and for long context the extra splits are what hide HBM
+        #     latency; dropping to 2 starves big-batch/long-ctx (measured regress).
+        tpc = 2 if batch * next_n <= 32 else 8
+        split_kv = pick_split_kv(batch, next_n, target_per_cu=tpc)
     return _fp4_paged_mqa_logits(
         q_p,
         q_s,
