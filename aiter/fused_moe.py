@@ -1648,7 +1648,7 @@ def _mxfp4_a4w4_stage1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
         w1_u8=w1,
-        w1_scale_u8=_mxfp4_scale_u8(w1_scale),
+        w1_scale_u8=_mxfp4_scale_u8_cached(w1_scale),
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=cumsum_tensor,
         m_indices=m_indices,
@@ -1718,7 +1718,7 @@ def _mxfp4_a4w4_stage2(
                 inter_sorted_quant=inter_sorted_quant,
                 inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
                 w2_u8=w2,
-                w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+                w2_scale_u8=_mxfp4_scale_u8_cached(w2_scale),
                 sorted_expert_ids=sorted_expert_ids,
                 cumsum_tensor=cumsum_tensor,
                 sorted_token_ids=sorted_token_ids,
@@ -1768,7 +1768,7 @@ def _mxfp4_a4w4_stage2(
         inter_sorted_quant=inter_sorted_quant,
         inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
         w2_u8=w2,
-        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        w2_scale_u8=_mxfp4_scale_u8_cached(w2_scale),
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=cumsum_tensor,
         sorted_token_ids=sorted_token_ids,
@@ -1984,11 +1984,24 @@ def _mxfp4_scale_u8(scale):
     same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
     uint8, or None) unchanged.
 
-    Not memoized: tensors hash by identity, so per-call intermediates never hit and
-    the cache would pin them on the device instead."""
+    Deliberately NOT lru_cache'd: the argument is a tensor, and lru_cache keeps a
+    strong ref to both key and value, so any per-step tensor handed to it is pinned
+    for the life of the cache. Use _mxfp4_scale_u8_cached only for weights.
+    """
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
+
+
+@functools.lru_cache(maxsize=2048)
+def _mxfp4_scale_u8_cached(scale):
+    """_mxfp4_scale_u8 for **model-lifetime** tensors (weights and their scales) only.
+
+    Caching saves a .view() per weight per layer on the decode hot path, but it is
+    only safe when the tensor lives as long as the model: lru_cache holds a strong
+    ref to its key, so a per-step tensor stays pinned until the 2048 slots fill.
+    """
+    return _mxfp4_scale_u8(scale)
 
 
 def _flydsl_stage2_fp8_enabled():
@@ -2088,10 +2101,12 @@ def _flydsl_v2_stage2_wrapper(
             # masked reduction to prevent speculative loads of stale NaN data.
             target.zero_()
     mxfp4_moe_gemm2(
+        # inter_states / a2_scale are per-step stage1 outputs -- uncached variant,
+        # or they get pinned in the lru_cache (see _mxfp4_scale_u8_cached).
         inter_sorted_quant=_mxfp4_scale_u8(inter_states),
         inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
-        w2_u8=_mxfp4_scale_u8(w2),
-        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        w2_u8=_mxfp4_scale_u8_cached(w2),
+        w2_scale_u8=_mxfp4_scale_u8_cached(w2_scale),
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=num_valid_ids,
         sorted_token_ids=sorted_token_ids,
