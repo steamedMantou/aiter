@@ -1845,7 +1845,7 @@ struct gmem {
 
     OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config())
         : cached_rsrc(make_buffer_rsrc(ptr, size, config))
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx950__)
         , raw_ptr(static_cast<const char*>(ptr))
 #endif
     {}
@@ -1905,6 +1905,30 @@ struct gmem {
         auto val = _load<vec, aux>(v_os + i_os, s_os, number<aux>{});
         dst = reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst) + i_os);
         *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
+#endif
+    }
+
+    template<index_t vec = 1, index_t aux = 0>
+    OPUS_D void _async_load_global(OPUS_LDS_ADDR void* dst,
+                                   __SIZE_TYPE__ v_os,
+                                   __SIZE_TYPE__ s_os = 0,
+                                   number<aux> = {}) {
+        using type = vector_type<vec>;
+#if defined(__gfx950__)
+        #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
+        #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
+        auto* src = raw_ptr + v_os + s_os;
+        __builtin_amdgcn_global_load_lds(
+            GPTR_(char, const_cast<char*>(src)),
+            LPTR_(char, dst),
+            sizeof(type),
+            0,
+            aux);
+        #undef GPTR_
+        #undef LPTR_
+#else
+        static_assert(sizeof(type) == 0,
+                      "64-bit global-to-LDS load is only available on gfx950");
 #endif
     }
 
@@ -2003,6 +2027,19 @@ struct gmem {
 
     template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>   // os in unit of T and cast to vector with vec; i_os = compile-time immediate byte offset (see _async_load notes; applies to both src and dst)
     OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<i_os>{}, number<aux>{}); }
+
+    template<index_t vec = 1, index_t aux = 0>
+    OPUS_D void async_load_global(void* dst,
+                                  __SIZE_TYPE__ v_os,
+                                  __SIZE_TYPE__ s_os = 0,
+                                  number<aux> = {}) {
+        _async_load_global<vec>(
+            reinterpret_cast<OPUS_LDS_ADDR void*>(
+                reinterpret_cast<__UINTPTR_TYPE__>(dst)),
+            v_os * sizeof(T),
+            s_os * sizeof(T),
+            number<aux>{});
+    }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -2170,8 +2207,8 @@ struct gmem {
     }
 
     __amdgpu_buffer_rsrc_t cached_rsrc;
-#if defined(__gfx1250__)
-    const char* raw_ptr;  // flat pointer for global_load_async_to_lds (gfx1250 uses global addressing, not buffer rsrc)
+#if defined(__gfx1250__) || defined(__gfx950__)
+    const char* raw_ptr;  // flat pointer for 64-bit global addressing
 #endif
 };
 

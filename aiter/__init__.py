@@ -114,6 +114,17 @@ else:
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
+
+    # Prebuilt-code-object build of the DSv4 MLA sparse prefill kernels.  The
+    # prefill kernel reads the paged KV cache as written, so no pass has to
+    # flatten it first.  pa_fp8_q_pack keeps the name the JIT module exports,
+    # so import one module or the other, never both -- torch resolves the
+    # custom op by name.  (Checked against this base: pa_sparse_prefill_opus
+    # above does not export that symbol, so the two imports coexist.)
+    from .ops.dsv4_mla_prefill import (  # noqa: F401
+        dsv4_mla_prefill,
+        pa_fp8_q_pack,
+    )
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
