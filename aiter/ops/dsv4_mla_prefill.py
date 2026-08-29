@@ -38,10 +38,6 @@ PA_FP8_MIN_H = 16
 PA_FP8_GLOBAL64 = True
 
 
-@compile_ops(_MODULE, fc_name="dsv4_mla_prefill_warmup", ffi_type="ctypes")
-def _warmup() -> int: ...
-
-
 @compile_ops(_MODULE, fc_name="dsv4_mla_q_pack_fwd", ffi_type="ctypes")
 def _q_pack(q_nope_bf16: torch.Tensor, out: torch.Tensor) -> int: ...
 
@@ -204,8 +200,3 @@ def dsv4_mla_prefill(
         scale_off_extend,
     )
     return out
-
-
-# Registering a code object is illegal while a stream is capturing, and with
-# cudagraphs the first call can land inside one. Force it here, at import.
-_warmup()

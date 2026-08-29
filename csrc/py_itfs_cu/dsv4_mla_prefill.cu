@@ -151,11 +151,12 @@ constexpr const char* CO_PATH = "/dsv4_mla_prefill/dsv4_mla_prefill.co";
 constexpr const char* SYM_PREFILL  = "_ZN10pa_fp8_h4021pa_prefill_fp8_kernelENS_12pa_fp8_kargsE";
 constexpr const char* SYM_Q_PACK   = "_ZN10pa_fp8_h4020pa_fp8_q_pack_kernelEPKDF16bPhii";
 
-// One instance per symbol, at file scope.  Construction is what registers the
-// code object, and registering is illegal while a stream is capturing, so the
-// warmup entry below and the op entries have to share these -- a function-local
-// static inside each entry would let the first real call construct inside a
-// capture.
+// One instance per symbol, constructed on first use.  Construction is what
+// registers the code object.  This used to be forced at import time from a
+// warmup entry, on the assumption that registering during a stream capture is
+// illegal; measured on ROCm 7.2.4 and 7.14 it is not, and every other
+// AiterAsmKernel call site in csrc registers lazily too -- asm_mla.cu builds its
+// decode kernels this way, inside the path vLLM captures with cudagraphs.
 AiterAsmKernel& k_prefill()  { static AiterAsmKernel k(SYM_PREFILL,  CO_PATH); return k; }
 AiterAsmKernel& k_q_pack()   { static AiterAsmKernel k(SYM_Q_PACK,   CO_PATH); return k; }
 
@@ -404,18 +405,6 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
 } // namespace
 
 AITER_CTYPES_ERROR_DEF
-
-// Registering a code object is illegal while a stream is capturing, and with
-// cudagraphs the first call can land inside one.  Registration is therefore
-// forced from a call the Python side makes at import time; nothing is launched.
-AITER_C_ITFS int dsv4_mla_prefill_warmup()
-{
-    return aiter_safe_call(g_aiter_last_error, [] {
-        k_prefill();
-        k_q_pack();
-        return 0;
-    });
-}
 
 // The impls above validate with AITER_CHECK, which throws, and an exception
 // must not cross the extern "C" boundary.  aiter_safe_call parks the message in
