@@ -394,7 +394,31 @@ struct pa_fp8_traits
 // ATOMs whose LDS read is issued before the drain.  With RQ_BATCH 1 the read
 // and the write share one register quad, so the pass is a chain of
 // O_TILES/RQ_SPLIT full round trips; a batch buys 4 VGPRs per extra ATOM and
-// pays one drain for all of them.  Must divide O_TILES/RQ_SPLIT.
+// pays one drain for all of them.  Must divide O_TILES/RQ_SPLIT, so with
+// RQ_SPLIT 2 the legal values are 1, 2, 7 and 14.
+//
+// What the batching buys: an ATT trace of RQ_BATCH 1 shows 24 sites in the
+// tile loop where s_waitcnt lgkmcnt(0) sits *immediately* after its
+// ds_read_b128 with nothing in between, each eating the full ~60-cycle LDS
+// latency -- 7.15% of the kernel's stall.  Batching collapses those
+// back-to-back drains.
+//
+// This knob was pinned at 1 for a long time, and the reason was register
+// pressure, not the mechanism: the 4 VGPRs per extra ATOM came out of scratch
+// (8 -> 40 bytes, 1 -> 15 vgpr spills, 17 of 37 scratch accesses inside the
+// mfma region) and that traffic cost more than the round trip it removed.
+// PA_GATHER_SPLIT above moves the kernel off the 512/512 edge, and on that
+// footing **all four values fit with zero spill** -- 510 vgpr, 254 agpr, 0
+// scratch, identical LDS.  Re-swept there, and timed as GPU kernel time rather
+// than wall clock, which matters at this size (real indices, N=8192 H=128
+// top-k 1024, 6 interleaved reps, 99% CI):
+//
+//   RQ_BATCH        1         2         7        14
+//   ms         2.5964    2.4878    2.4694    2.4620
+//   vs 2        -4.36%        --    +0.74%    +1.04%
+//
+// so 14.  Neutral at the decode shape (N=240 top-k 1024): +0.12%, |t| 0.5.
+// Output is bit-identical at every value -- this only moves instructions.
 // Fold the tile-frame maximum in registers before it reaches LDS.  128 threads
 // issuing atomicMax at one LDS address serialise in hardware, and that turned
 // out to be the single largest item in the no-collapse overhead: folding across
@@ -408,11 +432,131 @@ struct pa_fp8_traits
 #ifndef PA_RQ_FOLD
 #define PA_RQ_FOLD 1
 #endif
+#ifndef PA_MFMA_ASM_VOL
+#define PA_MFMA_ASM_VOL volatile
+#endif
+#ifndef PA_MFMA_ASM_VOL
+#define PA_MFMA_ASM_VOL volatile
+#endif
+#ifndef PA_MFMA_ASM
+#define PA_MFMA_ASM 0
+#endif
+#ifndef PA_MFMA_ASM_FILL
+#define PA_MFMA_ASM_FILL "s_nop 0\n\t"
+#endif
+#ifndef PA_MFMA_NOP
+#define PA_MFMA_NOP 0
+#endif
+#ifndef PA_SCHED_MODE
+#define PA_SCHED_MODE 0
+#endif
+#ifndef PA_GATHER_MODE
+#define PA_GATHER_MODE 0
+#endif
+// Do the requant shift with four hardware v_cvt_scalef32 (see
+// shift_exp_dword_cvt) instead of the nine-to-fourteen SWAR ops.  Worth 2.27%
+// on its own (2.4620 -> 2.4060 ms, kernel time, six interleaved reps), and the
+// *more* accurate of the two forms: exhaustively over all 255 e4m3 values
+// x k=0..8 against the RNE truth, the convert's total error is 3.135e-01
+// against the SWAR form's 2.735e+00, and it flushes nothing the SWAR form
+// keeps (the SWAR form flushes 14 values at k=0).
+//
+// Off by default all the same, because it is the only gate here that changes
+// the output at all: with it off, this header's object is bit-identical to the
+// one it came from over the whole 8192x128x512 result, and every other gate is
+// pure scheduling.  Turning it on differs in 543586 / 536870912 elements
+// (0.101%), max|delta| 2.680e-04, rel 2.967e-03 -- 1/8.4 of the kernel's own
+// 2.5e-02 fp8 floor, so it is defensible, but it is 2.27% of a kernel that is
+// 11-16% of TTFT and end-to-end resolution here is 10-30 ms.  It does not buy
+// anything downstream, and it would make "did precision move" a question that
+// has to be argued rather than shown.  Set to 1 to take it.
+#ifndef PA_RQ_CVT
+#define PA_RQ_CVT 0
+#endif
+// Timing-only ablation: 1 = keep every LDS read and write of the requant pass
+// but replace the shift with the identity, so the pass's LDS cost and its VALU
+// cost can be priced apart.  Numerics are wrong; never ship.
+#ifndef PA_RQ_NOOP
+#define PA_RQ_NOOP 0
+#endif
+// Timing-only ablation: 1 = drop the requant's LDS read-modify-write entirely
+// (the per-token exponent is still computed, so the rest of the kernel is
+// structurally unchanged).  Numerics are wrong; never ship.
+#ifndef PA_RQ_SKIP
+#define PA_RQ_SKIP 0
+#endif
+// Compute paged row indices in 32 bits and widen once, instead of carrying the
+// whole address chain in 64.  Bit-identical; 0 restores the old expressions.
+#ifndef PA_ADDR32
+#define PA_ADDR32 0
+#endif
+// Build P's per-token power-of-two scale straight out of the E8M0 byte instead
+// of going through an integer exponent and v_ldexp_f32, and let the fp8 pack's
+// own scale operand carry the tile-uniform remainder.  Every factor is an exact
+// power of two, so the result is bit-identical.
+//   1 = multiply form   2 = same, but the pack's scale is treated as a divisor
+#ifndef PA_P_SCALE_MUL
+#define PA_P_SCALE_MUL 1
+#endif
+// Leave the fp8 pack's `old` operand uninitialised.  Both halves are written, so
+// the zero it currently gets is a dead v_mov_b32 per packed dword.
+#ifndef PA_PACK_UNDEF
+#define PA_PACK_UNDEF 1
+#endif
+// Run tile n+1's requantisation inside tile n's PV, in the shadow of its mfmas.
+// The pass is independent of everything the tile has in flight and the matrix
+// pipe is idle for the whole of it, so at 1 wave/SIMD -- where nothing else can
+// fill an mfma's shadow -- this is the one piece of genuinely independent work
+// available.  Needs the tile frame double-buffered, tile 0 requantised in the
+// prologue, and one barrier moved rather than added; see the call site.
+#ifndef PA_RQ_PIPELINE
+#define PA_RQ_PIPELINE 0
+#endif
+// Stage the per-token exponent as the f32 power of two it denotes, not as the
+// raw E8M0 byte.  An E8M0 byte e means 2^(e-127), which is just `e << 23` as an
+// f32 bit pattern -- so the softmax can read the scale straight out of LDS
+// instead of extracting a byte and shifting it, 56 VALU per tile.  Costs a
+// ds_read_b128 where there was a ds_read_b32 (same instruction, 4x the data)
+// and four live registers where there was one packed dword.  Free in LDS: it
+// lands in cells 28-31 of slot block 1, which the copy skips and nothing else
+// uses.  Requires PA_P_SCALE_MUL, which is what consumes the scale as an f32.
+#ifndef PA_ETOK_F32
+#define PA_ETOK_F32 1
+#endif
+#if PA_ETOK_F32 && !PA_P_SCALE_MUL
+#error "PA_ETOK_F32 needs PA_P_SCALE_MUL"
+#endif
+#if PA_ETOK_F32 && PA_RQ_PIPELINE
+// The pipelined tile-0 cold path writes etok/etkt but not the f32 table, so the
+// first tile would read stale scales.  PA_RQ_PIPELINE is a measured dead end
+// anyway (see the note at its definition); this is here so the combination
+// cannot be built by accident rather than as a limitation worth lifting.
+#error "PA_ETOK_F32 and PA_RQ_PIPELINE are not wired together"
+#endif
+// 诊断用:往 prologue 塞 N 条一次性执行的哑指令,检验"代码体积本身要钱"这个假设
+#ifndef PA_ICACHE_PROBE
+#define PA_ICACHE_PROBE 0
+#endif
+// Which tile_max_e slot a buffer uses.  Pipelined, tile n reads its own frame
+// while its PV is already writing tile n+1's, so the two must not alias.
+#define PA_ME_SLOT(b) (PA_RQ_PIPELINE ? (b) : 0)
+#ifndef PA_ROPE_LATE
+#define PA_ROPE_LATE 0
+#endif
+#ifndef PA_GATHER_SPLIT
+#define PA_GATHER_SPLIT 2   // slots gathered above the requant pass; 4 = all (original)
+#endif
+#ifndef PA_RQ_SERIAL
+#define PA_RQ_SERIAL 0
+#endif
+#ifndef PA_RQ_AGPR
+#define PA_RQ_AGPR 0
+#endif
 #ifndef PA_RQ_BATCH
-#define PA_RQ_BATCH 1
+#define PA_RQ_BATCH 14
 #endif
 #ifndef PA_PV_BATCH
-#define PA_PV_BATCH 4   // swept 1/2/4/7/14 -> 322/309/311/312/388 us at N=1024
+#define PA_PV_BATCH 7   // swept 1/2/4/7/14 -> 322/309/311/312/388 us at N=1024
 #endif
     // o_tiles whose V is fetched before the batch's mfmas run.  Must divide
     // O_TILES (28): 1, 2, 4, 7, 14, 28.
@@ -425,6 +569,66 @@ struct pa_fp8_traits
     // Eight cells for eight consecutive token slots form a 128-byte "atom",
     // which is exactly what one ds_read_b64_tr_b8 consumes.
     static constexpr int ATOM = 128;                 // bytes
+// The staging copy for the next tile is issued in two halves instead of one
+// burst, split across the staging requantisation.  Both halves still land a
+// full tile ahead of their own compute, so the prefetch window is barely
+// shorter, and it is worth 0.68% at the production shape: 2.6451 -> 2.6269 ms,
+// t = -8.82 over 8 interleaved reps (real indices, N=8192 H=128 top-k 1024);
+// reproduced three times at -0.59% / -0.66% / -0.68%.
+//
+// The gain is not instruction density as such.  The ablation table above puts
+// 76 of the copy's 96 us in LDS write-port contention, and an ATT trace either
+// side of the split shows exactly that moving: per execution the DMA's own
+// stall drops 34.4% (71.2 -> 46.7 cycles) and s_waitcnt drops 8.9%, because the
+// copy's LDS writes now spread across the requant pass instead of piling
+// against each other.  Whole-kernel latency per issued instruction: -3.35%.
+//
+// 2 is an optimum, not a plateau: 1+3 is 0.68% *slower* (deferring three
+// quarters shortens the prefetch window more than the spread buys) and 3+1 is a
+// wash.  Pushing the second half further down, into the PV, is the 7% cliff the
+// RoPE copy already documents below -- its LDS writes then collide with the
+// PV's ds_read_b64_tr_b8 rather than with the requant's.  Short sequences see
+// nothing (T=1024: -0.10%, t=-0.35): with eight tiles the pipeline never
+// saturates and there is no vmcnt wait left to shorten.  0 restores the single
+// burst and is bit-identical to the kernel this came from.
+// Spell the prologue's four 8-byte exponent gathers out in assembly.
+//
+// The C++ form leaves them sharing one address register pair: the scheduler
+// sinks the address arithmetic into the load loop to keep live ranges short,
+// and SIInsertWaitcnts then has to drain before each reuse -- three full round
+// trips of 683 / 706 / 650 cycles, 2039 per wave, 2.4% of the kernel's stall.
+// It is not a register shortage: across that region 93 ArchVGPRs are dead and
+// 46 of them are even-aligned pairs.  The scheduler simply never sees the
+// alternative.  Writing the four pointers to separate C variables does not
+// help (rematerialising the arithmetic is cheaper than the live range: register
+// metrics improve but the serialisation stays, -0.05%, t = -0.59), and
+// laundering them through "+v" destroys the addressing form outright -- 17
+// gathers collapse to 1 and scratch goes to 40 accesses.
+//
+// The constraint that matters is "=a".  The C++ form lands these in AccVGPRs
+// (a[24:31] in the object #33 shipped); asking for "=v" instead takes eight
+// ArchVGPRs away from the whole function and the allocator pays for them in the
+// mfma region -- 12 spills, 12 scratch accesses inside the loop, +5.68%.  Only
+// the four addresses have to be ArchVGPRs, VMEM cannot take an AGPR address,
+// and those six extra fit in the dead set above.  With "=a" the register
+// metrics are item-for-item identical to the unassembled kernel (512 vgpr,
+// 8 B scratch, 1 vgpr spill) and it is 41 instructions shorter.
+//
+// Worth 0.66% at the production shape: 2.6243 -> 2.6082 ms, t = -8.70 over 12
+// interleaved reps (real indices, N=8192 H=128 top-k 1024), i.e. 57% of the
+// 1.16% the serialisation costs; the one remaining round trip is the rest.
+//
+// Prologue only, and that is not a preference.  Inline asm gets no automatic
+// s_waitcnt, so the drain has to be written into the block -- and the in-tile
+// fetch_exps already issues its four gathers with no wait at all (two address
+// pairs, 0 stall, results consumed a tile later).  Putting this there would
+// serialise what is currently free.  0 restores the C++ form.
+#ifndef PA_EXP_GATHER_ASM
+#define PA_EXP_GATHER_ASM 2
+#endif
+#ifndef PA_COPY_SPLIT
+#define PA_COPY_SPLIT 2
+#endif
 #ifndef PA_PAD
 #define PA_PAD 64  // swept 0..192 with conflict counters: timing flat, 64 marginally best
 #endif
@@ -460,6 +664,10 @@ struct pa_fp8_traits
     // one of these tables.  Costs no LDS and comes double-buffered for free.
     static constexpr int ETOK_OFF = 29 * ATOM;        // s_etok[p]
     static constexpr int ETKT_OFF = 30 * ATOM;        // s_etok_t[c*8+nt]
+    // 512 B of f32 scales, one per token.  Slot block 0 only has cells 28 and
+    // 31 spare, so this goes in slot block 1's tail four -- inside TILE_BYTES
+    // already, so it costs no LDS.
+    static constexpr int ETOKF_OFF = ROW + 28 * ATOM; // s_etok_f[p], f32
     static constexpr int SCALE_BYTES = EXP_BYTES;
     // The rope tile can only be double-buffered because the kv_scale gather is
     // gone; the per-32 scale array it needed pushed LDS over 160 KB.
@@ -643,6 +851,62 @@ __device__ inline f32x4 mma_qk(const i32x8& a, const i32x8& b, const f32x4& c,
 // Rescaling e4m3 by 2^-k is a subtraction of k from the exponent field; bytes
 // whose exponent would fall to <= 0 are flushed (their magnitude is < 2^-7 of
 // the token max).
+// Hardware-convert form of shift_exp_dword: fp8 -> bf16 (scaled by 2^-k) ->
+// fp8, four v_cvt_scalef32 against the SWAR form's nine-to-fourteen VALU.
+//
+// NOT bit-identical to the SWAR form, and the difference is entirely subnormal
+// handling: on underflow the SWAR form emits +/-0, the hardware convert emits
+// an e4m3 subnormal (i.e. it keeps a value the SWAR form throws away).  Making
+// it bit-identical costs ~6 SWAR ops to squash subnormals back to +/-0, which
+// gives the whole saving back.
+typedef __bf16 pa_bf16_t;
+typedef pa_bf16_t pa_bf16x2 __attribute__((ext_vector_type(2)));
+typedef short     pa_s16x2  __attribute__((ext_vector_type(2)));
+__device__ inline unsigned shift_exp_dword_cvt(unsigned dw, int k)
+{
+    // 2^-k as an f32 bit pattern; k is per-token, shared by the ATOM's 4 dwords
+    const float sc = __builtin_bit_cast(float, (127 - k) << 23);
+    pa_bf16x2 lo = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(dw, sc, false);
+    pa_bf16x2 hi = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(dw, sc, true);
+    // The two half-width packs below write *both* halves, so whatever `old`
+    // holds is dead -- but the intrinsic takes it as an input, so the compiler
+    // cannot prove that and a `= {0,0}` becomes a real v_mov_b32 per dword: 56
+    // per thread per tile in this pass alone, 234 in the kernel.
+    //
+    // Left uninitialised on purpose.  Every well-defined "don't care" was tried
+    // and all of them materialise a value: seeding from a live operand (`dw`)
+    // +31 insts and 2 vgpr, __builtin_nondeterministic_value +255,
+    // asm("":"=v") +297.  The output is verified bit-identical over the whole
+    // 8192x128x512 result, and this kernel ships as a prebuilt .co against a
+    // pinned toolchain -- but the bitcmp in op_tests is what keeps that honest,
+    // so re-run it whenever the compiler moves.
+#if PA_PACK_UNDEF
+    pa_s16x2 r;
+#else
+    pa_s16x2 r = {0, 0};
+#endif
+    r = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(r, lo, 1.0f, false);
+    r = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(r, hi, 1.0f, true);
+    return __builtin_bit_cast(unsigned, r);
+}
+// Pack four f32 into one dword of e4m3, dividing by a common power of two.
+// v_cvt_scalef32_pk_fp8_f32 applies the scale for free, which is what lets the
+// per-element ldexp collapse into a plain multiply by the E8M0 byte reread as
+// an f32 exponent field.
+__device__ inline int pack_fp8_scaled(float p0, float p1, float p2, float p3,
+                                      float s)
+{
+    // Same as shift_exp_dword_cvt: both halves are written, so the init is dead
+    // work.  See the note there about leaving it uninitialised.
+#if PA_PACK_UNDEF
+    pa_s16x2 r;
+#else
+    pa_s16x2 r = {0, 0};
+#endif
+    r = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(r, p0, p1, s, false);
+    r = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(r, p2, p3, s, true);
+    return __builtin_bit_cast(int, r);
+}
 __device__ inline unsigned shift_exp_dword(unsigned dw, int k)
 {
     const unsigned h = 0x80808080u;
@@ -664,6 +928,29 @@ __device__ inline int slot_lo_of(int p) { return 4 * ((p & 31) >> 4) + (p & 3); 
 __device__ inline f32x4 mma_bf16(const bf16x8& a, const bf16x8& b, const f32x4& c)
 {
     return __builtin_amdgcn_mfma_f32_16x16x32_bf16(a, b, c, 0, 0, 0);
+}
+
+// Hand-scheduled RoPE mfma pair.  Three things are load-bearing, each found by
+// a build that got slower:
+//   * srcB must be bound with "a", not "v".  The compiler keeps v_qr in AGPRs
+//     (the ISA reads a[8:11]); forcing it into ArchVGPRs is pure added pressure
+//     on a kernel at 510/512 -- see the same trap in the exp-gather asm.
+//   * dst and srcC must be separate operands ("=v" + "v"), not "+v".  The
+//     compiler rotates them (v[76:79] = ... v[82:85]) to break the WAR edge;
+//     pinning dst==srcC gives that up.
+//   * the separator has to be real work.  s_nop costs an issue slot for
+//     nothing; the next subtile's ds_read is independent (QK_PIPE==2 double
+//     buffers kkb/krb) and has to be issued anyway.
+__device__ inline void mma_bf16_pair(f32x4& d0, f32x4& d1,
+                                     const f32x4& c0, const f32x4& c1,
+                                     const bf16x8& a, const bf16x8& b0,
+                                     const bf16x8& b1)
+{
+    asm volatile("v_mfma_f32_16x16x32_bf16 %0, %4, %5, %2\n\t"
+                 PA_MFMA_ASM_FILL
+                 "v_mfma_f32_16x16x32_bf16 %1, %4, %6, %3"
+                 : "=v"(d0), "=v"(d1)
+                 : "v"(c0), "v"(c1), "v"(a), "a"(b0), "a"(b1));
 }
 
 __device__ inline i32x8 pack32(const i32x4& lo, const i32x4& hi)
@@ -745,21 +1032,47 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
     // them), so the page->grid-row remap happens here, three ALU ops at the
     // point of use, rather than by rewriting the index kernel.
     const int sgl_mask = (1 << sgl_page_shift) - 1;
+    // A *row index* fits 32 bits (4 G rows = 2.3 TB of 576-byte rows); only the
+    // byte offset needs 64.  Written as a 64-bit expression the compiler has to
+    // emit a full 64x32 multiply -- two v_mul_lo_u32 (quarter rate), a
+    // v_mad_u64_u32 and a v_add3 -- for every slot, every tile.  Keeping the row
+    // index in 32 bits and widening once leaves a single v_mad_u64_u32.
+    // The 64-bit product itself is unchanged, so this is bit-identical; only the
+    // intermediate is narrowed.
+    auto page_row32 = [&](int gid) -> unsigned {
+        return (unsigned)(gid >> sgl_page_shift) * (unsigned)sgl_rows_per_page;
+    };
+    auto grid_row32 = [&](int gid) -> unsigned {
+        if constexpr (!T::SGL_PAGED) return (unsigned)gid;
+        else return page_row32(gid) + (unsigned)(gid & sgl_mask);
+    };
     auto grid_row = [&](int gid) -> __SIZE_TYPE__ {
+#if (PA_ADDR32 & 1)
+        return (__SIZE_TYPE__)grid_row32(gid);
+#else
         if constexpr (!T::SGL_PAGED) return (__SIZE_TYPE__)gid;
         else return (__SIZE_TYPE__)(gid >> sgl_page_shift)
                         * (__SIZE_TYPE__)sgl_rows_per_page
                     + (__SIZE_TYPE__)(gid & sgl_mask);
+#endif
     };
     // Byte offset of a token's E8M0 slot inside its page's scale region.  After
     // the collapse pass all seven per-64 exponents are equal, so byte 0 is the
     // token exponent.
     auto exp_off = [&](int gid) -> __SIZE_TYPE__ {
+#if (PA_ADDR32 & 2)
+        // Same narrowing.  The old form chained *two* 64-bit multiplies:
+        // (u64)page * (u64)rows_per_page * (u64)stride.
+        return (__SIZE_TYPE__)page_row32(gid) * (__SIZE_TYPE__)kargs.stride_kv_row
+             + (__SIZE_TYPE__)sgl_scale_off
+             + (__SIZE_TYPE__)(unsigned)((gid & sgl_mask) * 8);
+#else
         return (__SIZE_TYPE__)(gid >> sgl_page_shift)
                    * (__SIZE_TYPE__)sgl_rows_per_page
                    * (__SIZE_TYPE__)kargs.stride_kv_row
              + (__SIZE_TYPE__)sgl_scale_off
              + (__SIZE_TYPE__)(gid & sgl_mask) * 8u;
+#endif
     };
 
     // ---- per-lane LDS read bases ----------------------------------------
@@ -809,10 +1122,11 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             row[half] = load(g_idx, tile_idx * T::KV_TILE + p)[0];
         }
     };
-    auto issue_copy = [&](const int (&row)[T::SLOTS_PER_WAVE], int buf) {
+    auto issue_copy_r = [&]<int H0, int H1>(const int (&row)[T::SLOTS_PER_WAVE],
+                                            int buf) {
         char* const kv_dst = smem + buf * T::TILE_BYTES;
 #pragma unroll
-        for (int half = 0; half < T::SLOTS_PER_WAVE; ++half) {
+        for (int half = H0; half < H1; ++half) {
             const int s_hi = T::SLOTS_PER_WAVE * warp + half;
             // unsigned, not int: a buffer resource addresses 4 GB and the
             // signed product overflowed at 2 GB, which 576-byte rows reach at
@@ -844,16 +1158,19 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
 #endif
         }
     };
+    auto issue_copy = [&](const int (&row)[T::SLOTS_PER_WAVE], int buf) {
+        issue_copy_r.template operator()<0, T::SLOTS_PER_WAVE>(row, buf);
+    };
     // The 16 packed scale bytes of each token are gathered into their own LDS
     // array rather than read back out of the KV tile: the tile's tail gets
     // zeroed during requantisation, and an E8M0 byte of 127 is 0x7F, which is
     // NaN in e4m3 -- 0 * NaN would poison the MFMA even with Q's tail zeroed.
     const bool scale_lane = ((lane >> 3) == 0);
     using exp_pf_t = std::conditional_t<T::SGL_PAGED, i32x2, i32x4>;
-    auto fetch_exps = [&](const int (&row)[T::SLOTS_PER_WAVE],
-                          exp_pf_t (&e)[T::SLOTS_PER_WAVE]) {
+    auto fetch_exps_r = [&]<int H0, int H1>(const int (&row)[T::SLOTS_PER_WAVE],
+                                            exp_pf_t (&e)[T::SLOTS_PER_WAVE]) {
 #pragma unroll
-        for (int half = 0; half < T::SLOTS_PER_WAVE; ++half) {
+        for (int half = H0; half < H1; ++half) {
 #if PA_SGLANG_PAGED
             // exp_off already points at the token's 8-byte slot, so one load
             // gets all seven per-64 exponents -- same instruction count as the
@@ -879,11 +1196,41 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
 #endif
         }
     };
-    auto commit_exps = [&](const exp_pf_t (&e)[T::SLOTS_PER_WAVE], int buf) {
+    auto fetch_exps = [&](const int (&row)[T::SLOTS_PER_WAVE],
+                          exp_pf_t (&e)[T::SLOTS_PER_WAVE]) {
+        fetch_exps_r.template operator()<0, T::SLOTS_PER_WAVE>(row, e);
+    };
+#if PA_EXP_GATHER_ASM && PA_SGLANG_PAGED
+    // See PA_EXP_GATHER_ASM.  Four distinct address pairs, four loads back to
+    // back, one drain -- instead of three serialised round trips.
+    auto fetch_exps_pro = [&](const int (&row)[T::SLOTS_PER_WAVE],
+                              exp_pf_t (&e)[T::SLOTS_PER_WAVE]) {
+        static_assert(T::SLOTS_PER_WAVE == 4, "the asm block is written for four slots");
+        const char* const b  = reinterpret_cast<const char*>(kv_base);
+        const char* const p0 = b + exp_off(row[0]);
+        const char* const p1 = b + exp_off(row[1]);
+        const char* const p2 = b + exp_off(row[2]);
+        const char* const p3 = b + exp_off(row[3]);
+#pragma unroll
+        for (int h = 0; h < T::SLOTS_PER_WAVE; ++h) e[h] = i32x2{0, 0};
+        if (scale_lane) {
+            asm volatile(
+                "global_load_dwordx2 %0, %4, off\n\t"
+                "global_load_dwordx2 %1, %5, off\n\t"
+                "global_load_dwordx2 %2, %6, off\n\t"
+                "global_load_dwordx2 %3, %7, off\n\t"
+                "s_waitcnt vmcnt(0)"
+                : "=a"(e[0]), "=a"(e[1]), "=a"(e[2]), "=a"(e[3])
+                : "v"(p0), "v"(p1), "v"(p2), "v"(p3)
+                : "memory");
+        }
+    };
+#endif
+    auto commit_exps_r = [&]<int H0, int H1>(const exp_pf_t (&e)[T::SLOTS_PER_WAVE], int buf) {
         if (!scale_lane) return;
         char* dst = smem_sc0 + buf * T::SCALE_BYTES;
 #pragma unroll
-        for (int half = 0; half < T::SLOTS_PER_WAVE; ++half) {
+        for (int half = H0; half < H1; ++half) {
             const int s_hi = T::SLOTS_PER_WAVE * warp + half;
             const int p = 32 * (s_hi >> 2) + 4 * (s_hi & 3) + p_lane;
 #if PA_SGLANG_PAGED
@@ -892,6 +1239,9 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             *reinterpret_cast<i32x4*>(dst + p * 16) = e[half];
 #endif
         }
+    };
+    auto commit_exps = [&](const exp_pf_t (&e)[T::SLOTS_PER_WAVE], int buf) {
+        commit_exps_r.template operator()<0, T::SLOTS_PER_WAVE>(e, buf);
     };
 
     // RoPE row indices for the *next* tile are fetched at the top of a tile and
@@ -925,7 +1275,7 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
     // because the vmcnt that has to precede it then blocks the RoPE copy's
     // issue, and that copy loses the overlap it used to get.
 #if PA_NO_COLLAPSE
-    __shared__ int tile_max_e;
+    __shared__ int tile_max_e[PA_RQ_PIPELINE ? 2 : 1];
 #endif
     auto stage_exps = [&](int b, int tbase) {
         char* const tp = smem + b * T::TILE_BYTES;
@@ -980,6 +1330,7 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
 #endif
                 char* const rq = smem + b * T::TILE_BYTES + shi * T::ROW
                                  + slo * 16;
+#if PA_RQ_SKIP == 0
 #pragma unroll
                 for (int a = 0; a < T::O_TILES; a += T::RQ_BATCH) {
                     // Each of the RQ_SPLIT threads on this token owns one
@@ -1003,7 +1354,9 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                             + slo * 16);
 #pragma unroll
                         for (int d = 0; d < 4; ++d)
-                            w[d] = pa_fp8::shift_exp_dword(w[d], k);
+                            w[d] = PA_RQ_NOOP ? (w[d] ^ (unsigned)(k & 0))
+                                 : PA_RQ_CVT  ? pa_fp8::shift_exp_dword_cvt(w[d], k)
+                                              : pa_fp8::shift_exp_dword(w[d], k);
                     } else {
                         // Every read of the batch is issued before the drain, so
                         // one LDS round trip covers RQ_BATCH ATOMs, not one.
@@ -1027,7 +1380,11 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                         for (int j = 0; j < T::RQ_BATCH; ++j)
 #pragma unroll
                             for (int d = 0; d < 4; ++d)
+#if PA_RQ_AGPR
+                                asm volatile("" : "+a"(t[j][d]) ::);
+#else
                                 asm volatile("" : "+v"(t[j][d]) ::);
+#endif
 #pragma unroll
                         for (int j = 0; j < T::RQ_BATCH; ++j) {
                             const int k = em
@@ -1039,10 +1396,23 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                                 rq + (a + j) * T::ATOM);
 #pragma unroll
                             for (int d = 0; d < 4; ++d)
-                                w[d] = pa_fp8::shift_exp_dword(t[j][d], k);
+                                w[d] = PA_RQ_NOOP ? (t[j][d] ^ (unsigned)(k & 0))
+                                     : PA_RQ_CVT  ? pa_fp8::shift_exp_dword_cvt(t[j][d], k)
+                                                  : pa_fp8::shift_exp_dword(t[j][d], k);
+#if PA_RQ_SERIAL
+                            // The batch exists to get every ds_read issued before
+                            // the drain -- NOT to interleave the arithmetic.  Left
+                            // alone the scheduler software-pipelines the shifts of
+                            // all RQ_BATCH atoms, doubling the live temporaries and
+                            // evicting the long-lived values that cross this pass.
+                            // Serialise the arithmetic so every atom reuses one
+                            // register quad; the reads are already in flight.
+                            __builtin_amdgcn_sched_barrier(0);
+#endif
                         }
                     }
                 }
+#endif  // PA_RQ_SKIP
                 et = em;          // the row now shares this exponent
             }
 #endif
@@ -1064,12 +1434,24 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                 // atomic per wave: 2 per tile instead of 128.
                 const int etg = pa_fp8::reduce_max_row16_i(
                                     pa_fp8::reduce_max_groups_i(etm));
-                if ((lane & 15) == 15) atomicMax(&tile_max_e, etg);
+                if ((lane & 15) == 15) atomicMax(&tile_max_e[PA_ME_SLOT(b)], etg);
 #else
-                if (tbase + tok < valid_kv_len) atomicMax(&tile_max_e, et);
+                if (tbase + tok < valid_kv_len) atomicMax(&tile_max_e[PA_ME_SLOT(b)], et);
 #endif
 #endif
                 etok.template store<1>((u8_t)et, tok);
+#if PA_ETOK_F32
+                // u8 view with byte offsets on purpose: the smem helpers
+                // dispatch on element count and silently emit nothing for a
+                // count they do not implement, so stay on the sizes s_etok
+                // already proves work.
+                {
+                    auto ef = make_smem(reinterpret_cast<u8_t*>(tp + T::ETOKF_OFF));
+                    ef.template store<4>(__builtin_bit_cast(
+                        decltype(ef.template _load<4>(0)),
+                        (unsigned)et << 23), tok * 4);
+                }
+#endif
                 etkt.template store<1>((u8_t)et, (tok & 15) * 8 + (tok >> 4));
             }
         }
@@ -1079,7 +1461,11 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
     exp_pf_t e_pf[T::SLOTS_PER_WAVE];
     load_rows(0, row_pf);
 #if PA_SGLANG_PAGED
+#if PA_EXP_GATHER_ASM
+    fetch_exps_pro(row_pf, e_pf);
+#else
     fetch_exps(row_pf, e_pf);
+#endif
     commit_exps(e_pf, 0);
 #endif
     issue_copy(row_pf, 0);
@@ -1087,6 +1473,64 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
     issue_rope_copy(rr_pf, 0);
     if constexpr (T::ROPE_BUFS == 2) load_rope_rows(1, rr_pf);
     load_rows(1, row_pf);   // indices for tile 1, awaited by the first barrier
+#if PA_RQ_PIPELINE
+    // Tile 0 has no previous tile to hide its requant in.  Calling stage_exps
+    // here instead would instantiate it a second time -- about a thousand
+    // instructions -- and this kernel pays roughly 0.0023% per *static*
+    // instruction even for code that runs once per workgroup: 2683 dummy
+    // one-shot instructions in the prologue measured +6.16%, because all the
+    // workgroups re-walk it and evict the tile loop from the instruction cache
+    // two CUs share.  So tile 0 gets a rolled cold path instead: one thread per
+    // token, all O_TILES atoms, ~100 instructions.  It must leave LDS
+    // bit-identical to stage_exps(0, 0) -- only the parallelism differs -- which
+    // is what the bitwise comparison in op_tests checks.
+    static_assert(PA_SGLANG_PAGED, "the cold path reads the paged scale region");
+    {
+        if (tid == 0) tile_max_e[0] = 0;
+        s_waitcnt_vmcnt(0_I);   // tile 0's copy, issued just above
+        lds_barrier();          // ... and every other wave's slice of it
+        if (tid < T::KV_TILE) {
+            const int tok = tid;
+            const int shi = slot_hi_of(tok), slo = slot_lo_of(tok);
+            auto sx0 = make_smem(reinterpret_cast<u8_t*>(smem_sc0));
+            const i32x2 scw = __builtin_bit_cast(
+                i32x2, sx0.template _load<8>(tok * 8));
+            // Read the block byte out of two registers rather than indexing a
+            // register-resident array: a runtime index there lands in scratch.
+            auto sbyte = [&](int blk) {
+                return ((blk < 4 ? scw[0] : scw[1]) >> (8 * (blk & 3))) & 0xff;
+            };
+            int em = 0;
+            for (int blk = 0; blk < T::D_NOPE / 64; ++blk) em = max(em, sbyte(blk));
+            char* const rq = smem + shi * T::ROW + slo * 16;
+#pragma unroll 1
+            for (int a = 0; a < T::O_TILES; ++a) {
+                const int k = em - sbyte(a / 4);
+                unsigned* w = reinterpret_cast<unsigned*>(rq + a * T::ATOM);
+#pragma unroll
+                for (int d = 0; d < 4; ++d)
+                    w[d] = PA_RQ_CVT ? pa_fp8::shift_exp_dword_cvt(w[d], k)
+                                     : pa_fp8::shift_exp_dword(w[d], k);
+            }
+            const int etm = (tok < valid_kv_len) ? em : 0;
+            const int etg = pa_fp8::reduce_max_row16_i(
+                                pa_fp8::reduce_max_groups_i(etm));
+            if ((lane & 15) == 15) atomicMax(&tile_max_e[0], etg);
+            make_smem(reinterpret_cast<u8_t*>(smem + T::ETOK_OFF))
+                .template store<1>((u8_t)em, tok);
+            make_smem(reinterpret_cast<u8_t*>(smem + T::ETKT_OFF))
+                .template store<1>((u8_t)em, (tok & 15) * 8 + (tok >> 4));
+        }
+    }
+#endif
+#if PA_ICACHE_PROBE
+    {   // 只跑一次,和 prologue 那次重量化同量级
+        int acc = tid;
+#pragma unroll
+        for (int i = 0; i < PA_ICACHE_PROBE; ++i) acc = acc * 3 + (acc >> 7) + i;
+        if (acc == 0x7fffffff) smem[0] = (char)acc;
+    }
+#endif
 
     int buf = 0, rbuf = 0;
     for (int tile = 0; tile < num_tiles; ++tile) {
@@ -1095,6 +1539,9 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
         auto s_exp  = make_smem(reinterpret_cast<u8_t*>(smem_sc0 + buf * T::SCALE_BYTES));
         auto s_etok = make_smem(reinterpret_cast<u8_t*>(tilep + T::ETOK_OFF));
         auto s_etkt = make_smem(reinterpret_cast<u8_t*>(tilep + T::ETKT_OFF));
+#if PA_ETOK_F32
+        auto s_etokf = make_smem(reinterpret_cast<u8_t*>(tilep + T::ETOKF_OFF));
+#endif
 
         // One barrier per tile.  Reaching it means every wave has finished the
         // PV reads of the *other* buffer, so the next tile's copy can be issued
@@ -1104,31 +1551,66 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
 #if PA_NO_COLLAPSE
         // Reset before any atomicMax can land; one extra barrier, and a single
         // barrier either way is free here (measured).
-        if (tid == 0) tile_max_e = 0;
+        if (tid == 0) tile_max_e[PA_ME_SLOT(buf ^ 1)] = 0;
         lds_barrier();
 #endif
 
         const bool has_next = (tile + 1 < num_tiles);
+
 #if PA_SGLANG_PAGED
+#if PA_GATHER_MODE == 1
+        // Every slot's load is issued up here; the ones beyond GATHER_SPLIT are
+        // committed immediately below, so their e_pf dies before the requant
+        // pass instead of living across it.  Same register saving as issuing
+        // them late, but their VMEM latency now hides behind issue_copy --
+        // issuing late leaves nothing at all to cover it (the load lands 20
+        // instructions ahead of its own s_waitcnt vmcnt(0)).
         if (has_next) fetch_exps(row_pf, e_pf);
+#elif PA_GATHER_SPLIT > 0
+        if (has_next)
+            fetch_exps_r.template operator()<0, PA_GATHER_SPLIT>(row_pf, e_pf);
+#endif
 #endif
         // writes buf^1 while the staging pass below touches buf, so it can be
         // issued here and pick up the staging pass as extra cover
+#if PA_COPY_SPLIT
+        if (has_next)
+            issue_copy_r.template operator()<0, PA_COPY_SPLIT>(row_pf, buf ^ 1);
+#else
         if (has_next) issue_copy(row_pf, buf ^ 1);
+#endif
         if constexpr (T::ROPE_BUFS == 2) {
             // double-buffered: no need to wait for every wave's PV-RoPE reads,
             // so the copy moves up here and gets a whole tile of cover
             if (has_next) issue_rope_copy(rr_pf, rbuf ^ 1);
         }
 
+#if PA_SGLANG_PAGED && PA_GATHER_MODE == 1 && PA_GATHER_SPLIT < 4
+        // kill the tail slots' e_pf here, after issue_copy has covered them
+        if (has_next)
+            commit_exps_r.template operator()<PA_GATHER_SPLIT, T::SLOTS_PER_WAVE>(
+                e_pf, buf ^ 1);
+#endif
         // ---- staging requantisation: per-32 E8M0 -> one per-token exponent
         // REQ_SPLIT threads per token, thread q handling blocks q, q+2, ... and
         // zeroing tail cells 28+q, 30+q.  Each thread touches only its own
         // token, so no barrier is needed inside this pass.
+#if !PA_RQ_PIPELINE
         stage_exps(buf, tile * T::KV_TILE);
+#endif
+        // Kept even when the requant moves out: it is what re-aligns the four
+        // waves before the QK.  Dropping it (barrier count back to baseline by
+        // removing *this* one instead of the tail one) measured 2.1% worse.
         lds_barrier();
+#if PA_COPY_SPLIT
+        // second half of the staging copy: still a full tile ahead of its own
+        // compute, but no longer back to back with the first half
+        if (has_next)
+            issue_copy_r.template operator()<PA_COPY_SPLIT, T::SLOTS_PER_WAVE>(
+                row_pf, buf ^ 1);
+#endif
 #if PA_NO_COLLAPSE
-        const int max_e_t = tile_max_e;
+        const int max_e_t = tile_max_e[PA_ME_SLOT(buf)];
         const int pv_e0   = max_e_t;   // byte = 127 + (max_e_t + dexp - MAXE), MAXE = 127
 #else
         const int max_e_t = max_e;
@@ -1140,15 +1622,31 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             // below it, so its ~800 stalled cycles are covered and e_pf dies
             // before the QK instead of living across the whole tile -- 16
             // ArchVGPRs, which are the binding resource here.
-#if PA_SGLANG_PAGED
+#if PA_SGLANG_PAGED && PA_GATHER_MODE == 1
+            commit_exps_r.template operator()<0, PA_GATHER_SPLIT>(e_pf, buf ^ 1);
+#elif PA_SGLANG_PAGED && PA_GATHER_SPLIT < 4
+            // The slots not issued above the requant pass.  Every slot left up
+            // there keeps its e_pf live across the whole pass -- the ArchVGPRs
+            // the requant's own LDS double buffer needs.  Splitting trades the
+            // pass's ~800 cycles of gather cover for that budget, slot by slot.
+            fetch_exps_r.template operator()<PA_GATHER_SPLIT, T::SLOTS_PER_WAVE>(
+                row_pf, e_pf);
+#endif
+#if PA_SGLANG_PAGED && PA_GATHER_MODE != 1
             commit_exps(e_pf, buf ^ 1);       // buf^1 was last read by tile-1
 #endif
             load_rows(tile + 2, row_pf2);     // OOB tiles read 0 from the buffer rsrc
             // double-buffered, the copy is issued at the *top* of the next
             // tile, so the indices must run one tile further ahead
+#if !PA_ROPE_LATE
             load_rope_rows(tile + (T::ROPE_BUFS == 2 ? 2 : 1), rr_pf);
+#endif
         }
 
+        // v_p and dexp are produced by the softmax and consumed by the PV, which
+        // the pipelined requant now sits between, so they live outside both.
+        i32x8 v_p[T::Q_SUB];
+        int   dexp[T::Q_SUB];   // new_m - m_ref, an exact non-negative integer
         // ---- QK: S[Q_SUB][16 heads, 128 tokens] --------------------------
         // the eight per-token exponents this lane needs as scale_a, one per
         // n-subtile, laid out so a single ds_read_b64 fetches all of them
@@ -1214,16 +1712,45 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                 constexpr int ds = i_ds.value;
                 static_for<T::Q_SUB>([&](auto i_qs) {
                     constexpr int qs = i_qs.value;
+#if PA_MFMA_NOP
+                    // The Q_SUB mfmas of one subtile write different
+                    // accumulators and issue back to back; a measured
+                    // 23.8-cycle issue stall against 3.3 with anything
+                    // in front.  s_nop is the one filler guaranteed to
+                    // have no dependence, so it prices the issue-pipe
+                    // theory directly.
+                    if constexpr (qs > 0) asm volatile("s_nop 0");
+#endif
                     acc[qs] = mma_qk<ds>(kkb[(T::QK_PIPE == 2) ? (nt & 1) : 0][ds], v_q[qs][ds], acc[qs], sa, q_sb[qs]);
                 });
             });
             // RoPE contributes to the very same S tile (same C layout)
             static_for<T::ROPE_KST>([&](auto i_st) {
                 constexpr int st = i_st.value;
+#if PA_MFMA_ASM
+                // Hand-scheduled pair.  Emitting the two Q_SUB mfmas *and* the
+                // separator inside one asm block is the point: a bare
+                // asm("s_nop") between two compiler-emitted mfmas gets absorbed
+                // -- the scheduler simply re-clusters them afterwards (81 nops
+                // moved only 7 of 63 back-to-back pairs).  Inside one block the
+                // order is fixed.
+                static_assert(T::Q_SUB == 2, "hand-scheduled pair assumes Q_SUB==2");
+                {
+                    f32x4 d0, d1;
+                    mma_bf16_pair(d0, d1, acc[0], acc[1],
+                                  krb[(T::QK_PIPE == 2) ? (nt & 1) : 0][st],
+                                  v_qr[0][st], v_qr[1][st]);
+                    acc[0] = d0; acc[1] = d1;
+                }
+#else
                 static_for<T::Q_SUB>([&](auto i_qs) {
                     constexpr int qs = i_qs.value;
+#if PA_MFMA_NOP
+                    if constexpr (qs > 0) asm volatile("s_nop 0");
+#endif
                     acc[qs] = mma_bf16(krb[(T::QK_PIPE == 2) ? (nt & 1) : 0][st], v_qr[qs][st], acc[qs]);
                 });
+#endif
             });
 #pragma unroll
             for (int qs = 0; qs < T::Q_SUB; ++qs)
@@ -1235,18 +1762,63 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             // 0x100 = DS read.  Worth a consistent 0.8-1.4%.  Do not expect more
             // from scheduling here: SQ_WAIT_INST_LDS is only 2.0% of wave cycles,
             // i.e. LDS latency is already almost entirely hidden.
+            //
+            // The ratio itself was swept (REP/DS/MFMA, real indices, N=8192, 8
+            // interleaved reps): 3/3/4 2.6248, 6/1/2 2.7703, 4/2/3 2.7921,
+            // 12/1/1 3.1735 ms.  Nothing beats the shape that matches the
+            // subtile.  It is worth knowing why, because an ATT trace says the
+            // prize is large: an mfma with any instruction in front of it stalls
+            // 3.3 cycles, one issued back to back with another stalls 23.8, and
+            // the back-to-back ones are 75% of all mfma stall -- 13.2% of the
+            // kernel's.  It is the mfma issue pipe, not accumulator dependence
+            // (the expensive group writes *different* accumulators).  But a
+            // subtile only has 9 ds_reads for 12 mfmas, so there is nothing left
+            // to put between them; 12/1/1 gets back-to-back from 33% down to 19%
+            // only by lengthening live ranges into 65 vgpr spills.  Retry when
+            // there are registers to spare, not before.
             static_for<PA_SCHED_REP>([&](auto) {
+#if PA_SCHED_MODE == 0
                 __builtin_amdgcn_sched_group_barrier(0x100, PA_SCHED_DS, 0);
                 __builtin_amdgcn_sched_group_barrier(0x008, PA_SCHED_MFMA, 0);
+#elif PA_SCHED_MODE == 1
+                // Interleave VALU, not DS.  The back-to-back mfmas come from
+                // asking for MFMA in runs; a single VALU between them drops the
+                // issue stall from 23.8 to 3.3 cycles.  VALU is the right filler
+                // because there are 618 of them against 218 ds_reads, and
+                // reordering VALU needs no extra registers -- unlike pulling a
+                // ds_read forward, which is what makes DS-based interleaving
+                // (12/1/1) spill.
+                __builtin_amdgcn_sched_group_barrier(0x100, PA_SCHED_DS, 0);
+                static_for<PA_SCHED_MFMA>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x002, 1, 0);
+                });
+#elif PA_SCHED_MODE == 2
+                // same, but allow any ALU (VALU or SALU) as the filler
+                __builtin_amdgcn_sched_group_barrier(0x100, PA_SCHED_DS, 0);
+                static_for<PA_SCHED_MFMA>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x001, 1, 0);
+                });
+#elif PA_SCHED_MODE == 3
+                // two fillers per mfma
+                __builtin_amdgcn_sched_group_barrier(0x100, PA_SCHED_DS, 0);
+                static_for<PA_SCHED_MFMA>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x002, 2, 0);
+                });
+#endif
             });
         });
 
         // ---- per-token dequant, mask, online softmax ---------------------
         const bool last = (tile == num_tiles - 1);
         const int tile_base = tile * T::KV_TILE;
-        i32x8 v_p[T::Q_SUB];
         float bias[T::Q_SUB], rsum[T::Q_SUB];
-        int   dexp[T::Q_SUB];   // new_m - m_ref, an exact non-negative integer
+#if PA_P_SCALE_MUL
+        float pscale[T::Q_SUB];
+#endif
+
 
         // num_tiles is block-uniform, so this is a scalar branch: the 64
         // compare/select pairs run on the final tile only instead of all eight.
@@ -1310,6 +1882,19 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             bias[qs]  = -m_ref[qs];
             dexp[qs]  = (int)(new_m - m_ref[qs]);
             rsum[qs]  = 0.f;
+#if PA_P_SCALE_MUL
+            // Reading the E8M0 byte as an f32 exponent field yields 2^(e_b-127),
+            // but the ldexp form's `e_b - max_e_t` is bias-free, so the extra
+            // 2^-127 has to come back here.  v_cvt_scalef32_pk_fp8_f32 *divides*
+            // by its scale (measured), so the divisor is
+            //   2^(max_e_t + dexp - 7 - 127),  f32 exponent field max_e_t+dexp-7.
+            // max_e_t is a real E8M0 byte (~120) and dexp is bounded by the fixed
+            // frame's ~96 octaves, so the field sits well inside [1,254]; the
+            // clamp only covers an all-padding tile, where max_e_t is 0 and every
+            // praw is 0 anyway.
+            pscale[qs] = __builtin_bit_cast(
+                float, (unsigned)max(max_e_t + dexp[qs] - 7, 1) << 23);
+#endif
         });
 
         // phase 2: exp2 -> fp8 P, fused with the bf16 PV-RoPE.
@@ -1345,8 +1930,26 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
 #pragma unroll
             for (int aa = 0; aa < 2; ++aa) {
                 const int a = 2 * st + aa;
+#if !PA_ETOK_F32
                 const int ew = __builtin_bit_cast(
                     int, s_etok.template _load<4>(16 * a + 4 * g));
+#endif
+#if PA_P_SCALE_MUL
+                // The four scales depend only on the token, not on the query
+                // sub-tile, so they are built once here rather than twice
+                // inside the Q_SUB loop, and as a vector so the apply becomes
+                // two v_pk_mul_f32 instead of four v_mul_f32.
+#if PA_ETOK_F32
+                const f32x4 sc4 = __builtin_bit_cast(
+                    f32x4, s_etokf.template _load<16>((16 * a + 4 * g) * 4));
+#else
+                f32x4 sc4;
+#pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    sc4[b] = __builtin_bit_cast(
+                        float, (unsigned)((ew >> (8 * b)) & 0xff) << 23);
+#endif
+#endif
                 static_for<T::Q_SUB>([&](auto i_qs) {
                     constexpr int qs = i_qs.value;
                     vector_t<float, 4> p4, praw;
@@ -1355,11 +1958,31 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                         const float p = __builtin_amdgcn_exp2f(
                             __builtin_fmaf(v_s[qs][a * 4 + b], c_row, bias[qs]));
                         praw[b] = p;
+#if !PA_P_SCALE_MUL
                         p4[b] = __builtin_ldexpf(
                             p, ((ew >> (8 * b)) & 0xff) - max_e_t + 7 - dexp[qs]);
+#endif
                     }
+#if PA_P_SCALE_MUL
+                    // The E8M0 byte is already an f32 exponent field: byte e
+                    // denotes 2^(e-127).  Multiplying by that exact power of two
+                    // and letting the pack's scale operand carry the tile-uniform
+                    // remainder replaces four v_ldexp_f32 plus their integer
+                    // exponent arithmetic, bit for bit.  Written element-wise on
+                    // purpose: forcing the pair into an aligned f32x4 so the
+                    // multiply becomes v_pk_mul_f32 costs 100 v_mov_b32 to build
+                    // the quads, which is worse than the 64 scalar multiplies it
+                    // saves (measured, both ways).
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) p4[b] = praw[b] * sc4[b];
+#endif
                     rsum[qs] += (praw[0] + praw[1]) + (praw[2] + praw[3]);
+#if PA_P_SCALE_MUL
+                    const int hw = pa_fp8::pack_fp8_scaled(p4[0], p4[1], p4[2],
+                                                           p4[3], pscale[qs]);
+#else
                     const int hw = __builtin_bit_cast(int, cast<fp8_t>(p4));
+#endif
                     v_p[qs][a] = hw;
 #pragma unroll
                     for (int b = 0; b < 4; ++b) pr[qs][aa * 4 + b] = (bf16_t)praw[b];
@@ -1424,6 +2047,17 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
         // RoPE PV stay bit-exact, which is what pins the fault to here).  Three
         // unrelated scheduling changes each tripped it.  Pin every compiler LDS
         // op above this point, then drain, so the counts mean what they say.
+#if PA_RQ_PIPELINE
+        // vmcnt(0) covers this wave's own slice of the tile+1 copy; the barrier
+        // makes it collective, because stage_exps touches every token while a
+        // wave only copied its own four slot blocks.  That barrier also sits
+        // after the RoPE PV, so it already means "every wave has finished
+        // reading the rope buffer" -- which is the tail barrier's only job, and
+        // why that one goes instead of this one being an addition.
+        s_waitcnt_vmcnt(0_I);
+        lds_barrier();
+        if (has_next) stage_exps(buf ^ 1, (tile + 1) * T::KV_TILE);
+#endif
         asm volatile("" ::: "memory");
         s_waitcnt_lgkmcnt(0_I);
 
@@ -1499,7 +2133,16 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
             if constexpr (T::ROPE_BUFS == 1) {
                 // single-buffered: it can only be refilled once every wave has
                 // finished reading it
+#if !PA_RQ_PIPELINE
                 lds_barrier();
+#endif
+#if PA_ROPE_LATE
+                // rr_pf otherwise lives from mid-tile across the whole QK/PV
+                // span -- RCOPY(4) ArchVGPRs held through the mfma region for
+                // no reason but to cover its own index load.  Same trade as
+                // PA_GATHER_SPLIT: give up that cover, get the registers.
+                load_rope_rows(tile + 1, rr_pf);
+#endif
                 issue_rope_copy(rr_pf, 0);
             }
 

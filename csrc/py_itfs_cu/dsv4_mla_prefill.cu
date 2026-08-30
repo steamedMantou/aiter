@@ -383,10 +383,9 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
     kargs.kv_stride_q_prefix = kv_stride_q_prefix;
     kargs.kv_stride_q_extend = kv_stride_q_extend;
     kargs.softmax_scale       = softmax_scale;
-    // This build is bound to the flat KV layout (PA_SGLANG_PAGED 0), so a paged
-    // page grid would be read as if it were flat -- wrong results, not an error.
-    // Reject it instead; the layout arguments stay in the signature so a paged
-    // build is a recompile rather than an API change.
+    // Layout is chosen by the descriptor validated above, not by this build:
+    // the paged addressing is compiled in (PA_SGLANG_PAGED defaults to 1) and a
+    // flat caller passes (0, 1, 448), which the same path handles.
     kargs.max_e_ptr           = reinterpret_cast<const int*>(kv_max_e.data_ptr());
 
     // ---- Launch ----------------------------------------------------------
