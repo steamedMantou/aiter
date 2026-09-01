@@ -233,6 +233,31 @@ struct pa_fp8_kargs
     // capture.  Unread under PA_NO_COLLAPSE, which takes the frame from each
     // tile instead; the field stays so the call signature does not move.
     const int* __restrict__ max_e_ptr;
+    // Optional permutation of the query rows over the grid: workgroup b handles
+    // row row_map[b] instead of the default reverse order.  Null keeps the
+    // default.  It changes only *which* CU computes a row, so the result is
+    // bit-identical; what it buys is placement.  Workgroups are dispatched
+    // round-robin over the XCDs (XCC_ID = blockIdx.x % 8), and each XCD has its
+    // own L2, so rows that read the same KV should land on the same XCD.  In
+    // MTP decode the query rows are request-major, which puts a sequence's
+    // spec-token rows on *different* XCDs -- each L2 then pulls that sequence's
+    // KV separately.  Mapping them onto one XCD is worth 4.0% on the top-k 1024
+    // layers and 3.8% on the compressed ones, at the production batch and in
+    // GPU kernel time over six interleaved reps.  The mechanism is not in
+    // doubt: TCP->TCC read requests move -0.1% -- the same work -- while the L2
+    // hit rate goes 23.6% -> 69.7% and off-chip reads fall 71%.
+    //
+    // How much of that a caller gets is a property of the permutation it
+    // builds, not of this kernel.  Cutting the row order into 8 contiguous runs
+    // and handing run c to the positions with b % 8 == c is what earns the
+    // figures above; permuting the (request, position) grid instead needs the
+    // request count to be a multiple of 8 and is worth about half as much when
+    // it is not.
+    //
+    // Must be a permutation of [0, N): the kernel writes exactly the rows it is
+    // handed, so a duplicate silently drops a row's output.  A caller that sets
+    // it also takes over the heavy-rows-first ordering the default provides.
+    const int* __restrict__ row_map;
 };
 
 struct pa_fp8_traits
@@ -672,8 +697,14 @@ struct pa_fp8_traits
     // The rope tile can only be double-buffered because the kv_scale gather is
     // gone; the per-32 scale array it needed pushed LDS over 160 KB.
 #ifndef PA_ROPE_BUFS
-// Double-buffering the rope tile is within noise (<1%) and puts LDS at exactly
-// 163840, so it is off by default; set PA_ROPE_BUFS=2 to try it.
+// Double-buffering the rope tile does not fit and cannot be made to: it puts
+// LDS at 167940 against a 163840 limit, and PA_PAD=0 -- the only slack left in
+// the staging tile -- recovers 2048 of the 4100, leaving it 2052 over.  That
+// remainder is the second SCALE buffer, which has to be double-buffered
+// alongside the tile it describes.  So this is not "off by default pending a
+// measurement"; the build fails.  Reaching it needs the rope buffer itself to
+// shrink (16384 B, held at ROW_R = 512 by the PA_PAD_R static_assert), which is
+// a change to the rope staging layout, not a knob.
 #define PA_ROPE_BUFS 1
 #endif
     static constexpr int ROPE_BUFS = PA_ROPE_BUFS;
@@ -1219,6 +1250,15 @@ __device__ void accumulate_segment(const pa_fp8_kargs& kargs,
                 "global_load_dwordx2 %1, %5, off\n\t"
                 "global_load_dwordx2 %2, %6, off\n\t"
                 "global_load_dwordx2 %3, %7, off\n\t"
+                // vmcnt(0) is the smallest legal count here, not laziness: these
+                // four loads are issued last and vmcnt retires in issue order, so
+                // waiting for them necessarily waits for the staging copies too.
+                // What it costs is the coupling of issue and wait inside one asm
+                // block -- the drain lands at the gather rather than at the
+                // consumer.  Ablated by relaxing this to vmcnt(8) (numerically
+                // wrong, timing only): 0.94% at the decode shape, |t| 2.1, 99% CI
+                // spanning zero.  Decoupling them would need the compiler to model
+                // this block's memory effects; it is not worth that.
                 "s_waitcnt vmcnt(0)"
                 : "=a"(e[0]), "=a"(e[1]), "=a"(e[2]), "=a"(e[3])
                 : "v"(p0), "v"(p1), "v"(p2), "v"(p3)
@@ -2168,7 +2208,10 @@ void pa_prefill_fp8_kernel(pa_fp8_kargs kargs)
     using namespace pa_fp8;
     using T = pa_fp8_traits;
 
-    const int q_token = kargs.N - 1 - (int)blockIdx.x;  // heavy tokens dispatch first
+    // Default is reverse order so the heaviest rows dispatch first; row_map
+    // overrides it wholesale (see the field's comment for why placement pays).
+    const int q_token = kargs.row_map ? kargs.row_map[blockIdx.x]
+                                      : kargs.N - 1 - (int)blockIdx.x;
     const int h_block = (int)blockIdx.y;
 
     const int tid  = (int)threadIdx.x;

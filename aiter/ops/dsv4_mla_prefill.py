@@ -36,6 +36,10 @@ _MODULE = "module_dsv4_mla_prefill"
 # admission threshold is actually compiled in.
 PA_FP8_MIN_H = 16
 PA_FP8_GLOBAL64 = True
+# Whether this build takes the optional `row_map` argument.  A caller reads it
+# instead of probing the signature: a keyword the op does not have fails at
+# *call* time, which under cudagraphs is the worst place to find out.
+PA_FP8_HAS_ROW_MAP = True
 
 
 @compile_ops(_MODULE, fc_name="dsv4_mla_q_pack_fwd", ffi_type="ctypes")
@@ -68,6 +72,7 @@ def _h40_prefill(
     page_shift_extend: int,
     rows_per_page_extend: int,
     scale_off_extend: int,
+    row_map: torch.Tensor,
 ) -> int: ...
 
 
@@ -122,6 +127,7 @@ def _h40_fake(
     page_shift_extend: int = 0,
     rows_per_page_extend: int = 1,
     scale_off_extend: int = 448,
+    row_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -155,6 +161,7 @@ def dsv4_mla_prefill(
     page_shift_extend: int = 0,
     rows_per_page_extend: int = 1,
     scale_off_extend: int = 448,
+    row_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """DeepSeek-V4 h40 sparse prefill attention, both GEMMs on fp8.
 
@@ -198,5 +205,6 @@ def dsv4_mla_prefill(
         page_shift_extend,
         rows_per_page_extend,
         scale_off_extend,
+        _empty_i32(q_nope) if row_map is None else row_map,
     )
     return out

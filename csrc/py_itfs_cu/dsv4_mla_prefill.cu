@@ -113,8 +113,12 @@ struct PaFp8Kargs
     int kv_stride_q_extend;
     float softmax_scale;
     const int* max_e_ptr;
+    // Optional permutation of query rows over the grid; null keeps the default
+    // reverse order.  Appended last so every offset below is unchanged.
+    const int* row_map;
 };
-static_assert(sizeof(PaFp8Kargs) == 208, "kargs layout drifted from the .co");
+static_assert(sizeof(PaFp8Kargs) == 216, "kargs layout drifted from the .co");
+static_assert(offsetof(PaFp8Kargs, row_map) == 208, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, out_ptr) == 56, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, N) == 96, "kargs layout drifted");
 static_assert(offsetof(PaFp8Kargs, sgl_page_shift) == 144, "kargs layout drifted");
@@ -217,6 +221,7 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
                                         int page_shift_extend,
                                         int rows_per_page_extend,
                                         int scale_off_extend,
+                                        aiter_tensor_t& row_map,
                                          hipStream_t stream)
 {
     constexpr int D_NOPE_PADDED = PA_FP8_H40_D_NOPE_PADDED;
@@ -387,6 +392,16 @@ void dsv4_mla_prefill_impl(aiter_tensor_t& q_nope,
     // the paged addressing is compiled in (PA_SGLANG_PAGED defaults to 1) and a
     // flat caller passes (0, 1, 448), which the same path handles.
     kargs.max_e_ptr           = reinterpret_cast<const int*>(kv_max_e.data_ptr());
+    // Empty tensor means "no permutation", the same sentinel kv_lens_* uses.
+    if(row_map.numel() > 0)
+    {
+        AITER_CHECK(row_map.numel() >= N, "row_map must hold at least N entries");
+        kargs.row_map = reinterpret_cast<const int*>(row_map.data_ptr());
+    }
+    else
+    {
+        kargs.row_map = nullptr;
+    }
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope.device_id);
@@ -449,6 +464,7 @@ AITER_C_ITFS int dsv4_mla_prefill_fwd(aiter_tensor_t* q_nope,
                                                    int64_t page_shift_extend,
                                                    int64_t rows_per_page_extend,
                                                    int64_t scale_off_extend,
+                                                   aiter_tensor_t* row_map,
                                                    void* stream)
 {
     PA_H40_CO_ENTRY(
@@ -464,6 +480,7 @@ AITER_C_ITFS int dsv4_mla_prefill_fwd(aiter_tensor_t* q_nope,
             static_cast<int>(page_shift_extend),
             static_cast<int>(rows_per_page_extend),
             static_cast<int>(scale_off_extend),
+            *row_map,
             static_cast<hipStream_t>(stream)),
         "dsv4_mla_prefill")
 }
