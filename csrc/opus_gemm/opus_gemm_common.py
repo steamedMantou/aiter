@@ -667,6 +667,18 @@ a8w8_mxscale_bmm_pipeline_kernels_list = {
     151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
     152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
     # kid158: preload BOTH SFA (per-token) and SFB (block) scale panels into LDS.
+    #
+    # kid158's 256x256 tile runs one WG per CU, so the DSV4 wo_a prefill shape
+    # (g16 n1024 k4096) costs ceil(ceil(m/256)*4*16 / 256) rounds and half-integer
+    # M pays for a half-empty tail round: m3584 is 3.5 rounds and takes the same 4
+    # rounds as m4096 (measured 67.2 vs 66.3 us per round, 1744 vs 2072 TFLOPS).
+    # A B_M=128 twin, which doubles the WG count to a whole 7 rounds, does not fix
+    # it -- the smaller tile also doubles occupancy, so it lands back on 3.5 rounds
+    # and measures 4.4% slower at m3584 (it does win 11.5% at m2560, which no
+    # deployed chunk size hits). A B_N=128 twin does not compile at all: the e8m0
+    # path asserts HALF_B_N == GROUP_N and B_N=128 gives a 64-wide half tile.
+    # Recovering m3584's missing ~330 TFLOPS needs a persistent or stream-K
+    # schedule, not another tile.
     158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
 }
 

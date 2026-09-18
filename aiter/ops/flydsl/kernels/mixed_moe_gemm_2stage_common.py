@@ -3560,6 +3560,7 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    per_expert_w_bytes = w_nbytes // experts
     shared_w_nbytes = model_dim * inter_dim
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
@@ -3824,7 +3825,6 @@ def compile_mixed_moe_gemm2_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
@@ -3987,6 +3987,16 @@ def compile_mixed_moe_gemm2_common(
                 delta_expert_idx = arith.index_cast(ir.IndexType.get(), delta_expert)
                 delta_b = delta_expert_idx * arith.constant(expert_b_stride, index=True)
                 expert_b_base = prev_expert_b_base + delta_b
+
+            # Keep the 32-bit buffer offsets expert-relative, as in stage1.
+            # Widen before adding the expert offset to the allocation address.
+            w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
+                arith.addi(
+                    arith.index_cast(T.i64, fx.ptrtoint(arg_w)),
+                    arith.index_cast(T.i64, expert_b_base),
+                ),
+                num_records_bytes=per_expert_w_bytes,
+            )
 
             first_tok = buffer_ops.buffer_load(
                 sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
@@ -4245,10 +4255,9 @@ def compile_mixed_moe_gemm2_common(
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
-                    def load_cell(rsrc, expert_base, stride_n0, elem_type, k0):
+                    def load_cell(rsrc, stride_n0, elem_type, k0):
                         idx_pack = (
-                            expert_base
-                            + blk[ni] * arith.constant(stride_n0, index=True)
+                            blk[ni] * arith.constant(stride_n0, index=True)
                             + k0 * arith.constant(b_stride_k0, index=True)
                             + k1 * arith.constant(b_stride_klane, index=True)
                             + intra[ni] * arith.constant(b_stride_nlane, index=True)
@@ -4278,14 +4287,12 @@ def compile_mixed_moe_gemm2_common(
                         shared_k0_base += arith.constant(ku * 2, index=True)
                         s0, s1 = load_cell(
                             shared_w_rsrc,
-                            arith.index(0),
                             shared_b_stride_n0,
                             default_f8_type(),
                             shared_k0_base,
                         )
                         s2, s3 = load_cell(
                             shared_w_rsrc,
-                            arith.index(0),
                             shared_b_stride_n0,
                             default_f8_type(),
                             shared_k0_base + arith.index(1),
@@ -4293,16 +4300,14 @@ def compile_mixed_moe_gemm2_common(
                         return s0, s1, s2, s3
 
                     b0, b1 = load_cell(
-                        w_rsrc,
-                        expert_b_base,
+                        w_rsrc_e,
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
-                            expert_b_base,
+                            w_rsrc_e,
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + arith.index(1),

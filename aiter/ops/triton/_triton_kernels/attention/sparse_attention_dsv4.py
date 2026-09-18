@@ -250,7 +250,9 @@ def _get_prefill_autotune_configs():
             num_warps=nw,
             num_stages=ns,
         )
-        for BLOCK_H in [32, 64]
+        # BLOCK_H=16 covers the TP-sharded DSV4 case (128 q heads / TP8), where
+        # a 32-wide head tile masks off half the MFMA lanes.
+        for BLOCK_H in [16, 32, 64]
         for BLOCK_K in [16, 32, 64]
         for WPE in [
             0,

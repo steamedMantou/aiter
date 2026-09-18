@@ -1,0 +1,4 @@
+,ctx_lens,batch_size,num_head,qk_head_dim,v_head_dim,dtype,kv_dtype,block_size,varlen,is_causal,load_metadata,dump_metadata,profile_ps,skip_reference,us_mla_prefill_ps,err fp8,acc result
+0,2048,1,1,192,128,torch.float8_e4m3fn,torch.float8_e4m3fn,1,False,False,False,False,False,False,22.571111111111147,0,passed
+1,2048,4,1,192,128,torch.float8_e4m3fn,torch.float8_e4m3fn,1,False,False,False,False,False,False,31.941920000000078,0,passed
+2,2048,16,1,192,128,torch.float8_e4m3fn,torch.float8_e4m3fn,1,False,False,False,False,False,False,47.31774999999997,0,passed

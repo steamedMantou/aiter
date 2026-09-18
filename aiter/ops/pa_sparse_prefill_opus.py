@@ -325,10 +325,161 @@ def pa_sparse_prefill_fp8_opus(
     return out
 
 
+def _empty_i32(like: torch.Tensor) -> torch.Tensor:
+    """Sentinel for an omitted optional tensor argument (numel 0 == not given)."""
+    return torch.empty(0, dtype=torch.int32, device=like.device)
+
+
+@compile_ops("module_pa_sparse_prefill_opus_paged", develop=True)
+def pa_sparse_prefill_fp8_opus_paged_fwd(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    kv_lens_prefix: torch.Tensor,
+    kv_lens_extend: torch.Tensor,
+    kv_stride_q_prefix: int,
+    kv_stride_q_extend: int,
+) -> None: ...
+
+
+def _pa_sparse_prefill_fp8_opus_paged_fake(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
+) -> torch.Tensor:
+    if out is not None:
+        return out
+    t, h, _ = q_nope.shape
+    return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
+
+
+@torch_compile_guard(
+    mutates_args=["out"], gen_fake=_pa_sparse_prefill_fp8_opus_paged_fake
+)
+def pa_sparse_prefill_fp8_opus_paged(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
+) -> torch.Tensor:
+    """Sparse prefill attention reading vLLM's ``fp8_ds_mla`` paged pool directly."""
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus_paged requires gfx950, got {gfx}"
+        )
+    if q_nope.dtype != torch.bfloat16:
+        raise RuntimeError(f"q_nope must be bf16 [N, H, 448], got {q_nope.dtype}")
+    if unified_kv_nope.dtype != kv_nope.dtype:
+        raise RuntimeError(
+            "unified_kv_nope/kv_nope dtype mismatch: "
+            f"{unified_kv_nope.dtype}, {kv_nope.dtype}"
+        )
+    if q_rope.dtype != torch.bfloat16:
+        raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
+
+    t, h = q_nope.shape[0], q_nope.shape[1]
+    if h <= 32:
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus_paged is only compiled for H > 32, got H={h}"
+        )
+    if out is None:
+        out = torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
+    elif out.shape != (t, h, 512) or out.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"out shape/dtype mismatch: got shape={tuple(out.shape)} dtype={out.dtype}, "
+            f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
+        )
+
+    pa_sparse_prefill_fp8_opus_paged_fwd(
+        q_nope,
+        q_rope,
+        unified_kv_nope,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_nope,
+        kv_rope,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+        float(softmax_scale),
+        int(page_shift_prefix),
+        int(rows_per_page_prefix),
+        int(scale_off_prefix),
+        int(page_shift_extend),
+        int(rows_per_page_extend),
+        int(scale_off_extend),
+        _empty_i32(q_nope) if kv_lens_prefix is None else kv_lens_prefix,
+        _empty_i32(q_nope) if kv_lens_extend is None else kv_lens_extend,
+        int(kv_stride_q_prefix),
+        int(kv_stride_q_extend),
+    )
+    return out
+
+
 __all__ = [
     "pa_sparse_prefill_fp8_gfx950_opus_fwd",
     "pa_sparse_prefill_fp8_gfx1250_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
+    "pa_sparse_prefill_fp8_opus_paged",
+    "pa_sparse_prefill_fp8_opus_paged_fwd",
     "pa_sparse_prefill_gfx950_opus_fwd",
     "pa_sparse_prefill_gfx1250_opus_fwd",
     "pa_sparse_prefill_opus",

@@ -1918,12 +1918,15 @@ struct gmem {
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
         auto* src = raw_ptr + v_os + s_os;
-        __builtin_amdgcn_global_load_lds(
-            GPTR_(char, const_cast<char*>(src)),
-            LPTR_(char, dst),
-            sizeof(type),
-            0,
-            aux);
+        // The size operand is an IMMARG, so it has to reach the builtin as one of
+        // the literals the ISA accepts; sizeof(type) is rejected even though it is
+        // constant. Dispatch like _async_load above.
+        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_lds(GPTR_(char, const_cast<char*>(src)), LPTR_(char, dst),  1, 0, aux); }
+        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_lds(GPTR_(char, const_cast<char*>(src)), LPTR_(char, dst),  2, 0, aux); }
+        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_lds(GPTR_(char, const_cast<char*>(src)), LPTR_(char, dst),  4, 0, aux); }
+        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_global_load_lds(GPTR_(char, const_cast<char*>(src)), LPTR_(char, dst), 12, 0, aux); }
+        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_lds(GPTR_(char, const_cast<char*>(src)), LPTR_(char, dst), 16, 0, aux); }
+        else { static_assert(sizeof(type) == 0, "_async_load_global: gfx950 global-to-LDS takes 1, 2, 4, 12 or 16 byte vectors"); }
         #undef GPTR_
         #undef LPTR_
 #else

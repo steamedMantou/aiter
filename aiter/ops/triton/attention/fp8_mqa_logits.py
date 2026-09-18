@@ -201,10 +201,26 @@ def fp8_mqa_logits(
             loop_variant = 0
             waves_per_eu = 4
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 2 if num_heads <= 32 else 1
-            block_kv = 64 if num_heads <= 32 else 32
-            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
-            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            if num_heads <= 32:
+                num_warps = 2
+                block_kv = 64
+                block_m = 2 if seq_len > 4096 else 1
+                mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            else:
+                # Above 32 heads these used to fall back to a single warp on a
+                # 32-wide KV tile with the narrow MFMA, which leaves most of
+                # the matrix unit idle. Measured at num_heads=64,
+                # head_size=128 -- DeepSeek-V4-Pro's indexer -- across the four
+                # shapes of a 100k prefill sharded 8 ways: the wide tile is
+                # 13.7% to 29.6% faster, 1632 us summed over the shapes against
+                # 1353, or 8.4 ms of the request over the 30 layers that run
+                # it. Same arithmetic; the logits move 2.2e-7 relative, which
+                # is the fp32 accumulation order changing. BLOCK_M stays 1
+                # because 2 measured worse at every shape.
+                num_warps = 4
+                block_kv = 128
+                block_m = 1
+                mfma_nonk_dim = 32
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,

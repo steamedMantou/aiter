@@ -24,9 +24,7 @@ import triton
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-    _sparse_attn_prefill_kernel,
-)
+from aiter.ops.triton.attention.sparse_attention_dsv4 import sparse_mla_fwd_dsv4
 from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
@@ -49,6 +47,7 @@ def pa_prefill_sparse(
     attn_sink: torch.Tensor | None,
     softmax_scale: float,
     has_invalid: bool | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
@@ -69,6 +68,7 @@ def pa_prefill_sparse(
         kv_indptr_extend:  [T+1] int32 — true prefix sum. ``None`` for none.
         attn_sink:         [H] fp32 — per-head softmax-denom bias.
         softmax_scale:     float.
+        out:               Optional output buffer matching ``q``.
 
     Returns:
         [T, H, D] attention output, same dtype as q.
@@ -95,7 +95,7 @@ def pa_prefill_sparse(
             f"extend_indices={kv_indices_extend.shape[0]}"
         )
 
-        out = torch.empty_like(q)
+        out = _get_output_buffer(q, out)
         assert (
             kv_indices_prefix.dtype == torch.int32 and kv_indices_prefix.is_contiguous()
         )
@@ -167,7 +167,11 @@ def pa_prefill_sparse(
         )
         return out
 
-    elif DEVICE_ARCH == "gfx950":
+    # The gfx950 bh64 Gluon regime requires T to be divisible by one XCD
+    # group. Route tail chunks to the portable kernel instead.
+    elif DEVICE_ARCH == "gfx950" and (
+        q.shape[1] not in (64, 128) or q.shape[0] % 64 == 0
+    ):
         kv_indices_prefix, kv_indptr_prefix = _prep_single_source(
             kv_indices_prefix,
             kv_indptr_prefix,
@@ -175,7 +179,7 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        out = torch.empty_like(q)
+        out = _get_output_buffer(q, out)
         gluon_mla_sparse_prefill(
             q,  # q_nope = combined-D query (RoPE folded in)
             None,  # q_pe unused in prefill mode
@@ -199,39 +203,15 @@ def pa_prefill_sparse(
             kv_indices_extend,
             kv_indptr_extend,
         )
-        attn_sink = attn_sink or torch.empty(1, device="cuda", dtype=torch.float32)
-        has_attn_sink = attn_sink is not None
-        num_queries, num_heads, head_dim = q.shape
-        block_d = triton.next_power_of_2(head_dim)
-        out = torch.empty_like(q)
-
-        grid = lambda META: (
-            num_queries,
-            triton.cdiv(num_heads, META["BLOCK_H"]),
+        return sparse_mla_fwd_dsv4(
+            q=q,
+            kv=unified_kv,
+            kv_indices=kv_indices_prefix,
+            kv_indptr=kv_indptr_prefix,
+            softmax_scale=softmax_scale,
+            attn_sink=attn_sink,
+            out=out,
         )
-        _sparse_attn_prefill_kernel[grid](
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            num_heads,
-            head_dim,
-            unified_kv.shape[0],
-            float(softmax_scale),
-            HAS_ATTN_SINK=has_attn_sink,
-            BLOCK_D=block_d,
-        )
-        return out
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +249,22 @@ def _prep_single_source(
         _as_int32_contiguous_1d(kv_indices_prefix),
         _as_int32_contiguous_1d(kv_indptr_prefix),
     )
+
+
+def _get_output_buffer(
+    q: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty_like(q)
+    if out.shape != q.shape:
+        raise ValueError(
+            f"out shape mismatch: expected {tuple(q.shape)}, got {tuple(out.shape)}"
+        )
+    if out.dtype != q.dtype:
+        raise ValueError(f"out dtype mismatch: expected {q.dtype}, got {out.dtype}")
+    if out.device != q.device:
+        raise ValueError(f"out device mismatch: expected {q.device}, got {out.device}")
+    return out
 
 
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
