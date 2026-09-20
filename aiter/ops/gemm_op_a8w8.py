@@ -1115,7 +1115,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif (
+            libtype == "flydsl"
+            and is_flydsl_available()
+            and get_gfx() == "gfx1250"
+        ):
+            # The mxfp8_128 flydsl port is gfx1250-only. The tuner times flydsl
+            # through the gfx950 preshuffle pipeline, so a tuned row can name it
+            # on gfx950; fall through to CK rather than raising there.
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
